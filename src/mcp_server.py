@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "StravaCyclingCoach",
+    instructions=(
+        "Whenever the user asks for cycling or Zwift training advice, session recommendations, "
+        "or recovery guidance, ALWAYS call get_training_playbook(), get_current_readiness(), "
+        "and get_recent_activities(days=10) first. Base all target wattages on the rolling "
+        "effective_ftp and heart rate caps on effective_max_hr."
+    ),
     host=config.MCP_HOST,
     port=config.MCP_PORT,
 )
@@ -34,6 +40,33 @@ def _load_playbook() -> str:
         "(mounted at `/app/server/playbook.md` in Docker) to make it available here."
     )
 
+@mcp.prompt()
+def daily_coaching_check(
+    question: str = "What training should I do today?",
+    available_minutes: int = 60,
+    how_i_feel: str = "normal",
+) -> str:
+    """
+    Structured coaching prompt that loads playbook rules, readiness (CTL/ATL/TSB/FTP),
+    and recent rides before recommending today's session.
+    """
+    return f"""You are acting as my personal AI cycling coach.
+
+Before answering my question, you MUST call these three MCP tools in order:
+1. `get_training_playbook()` — to review my historical responder profile, effective training patterns, and schedule preferences.
+2. `get_current_readiness()` — to check my rolling 90-day FTP, 365-day Max HR, CTL (fitness), ATL (fatigue), TSB (form), and 7-day zone totals.
+3. `get_recent_activities(days=10)` — to see my recent sessions, intensity factor, aerobic decoupling, and HIIT surges.
+
+Athlete context for today:
+- Question / Goal: {question}
+- Available Time: {available_minutes} minutes
+- Subjective Feeling / Leg Fatigue: {how_i_feel}
+
+Based on the data returned by those tools and my playbook findings:
+1. Briefly summarize my current readiness (TSB, recent load, and what training stimulus is currently missing or overloaded).
+2. Recommend a specific session (e.g., exact Zwift route/workout type, interval structure, or active recovery spin).
+3. Specify exact target wattages and heart rate caps calculated from my current rolling `effective_ftp` and `effective_max_hr`, plus expected TSS.
+"""
 
 @mcp.resource("coach://playbook")
 def playbook_resource() -> str:
