@@ -9,6 +9,7 @@ MAX_HR: int = int(os.getenv("MAX_HR", "185"))
 
 # Storage & data paths
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./server"))
+STRAVA_DIR: Path = Path(os.getenv("STRAVA_DIR", str(DATA_DIR / "strava_export")))
 DB_PATH: Path = Path(os.getenv("DB_PATH", str(DATA_DIR / "cycling.db")))
 CSV_PATH: Path = Path(os.getenv("CSV_PATH", str(DATA_DIR / "enriched_activities.csv")))
 PLAYBOOK_PATH: Path = Path(os.getenv("PLAYBOOK_PATH", str(DATA_DIR / "playbook.md")))

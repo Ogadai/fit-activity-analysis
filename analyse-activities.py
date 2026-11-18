@@ -11,17 +11,20 @@ import numpy as np
 import pandas as pd
 import requests
 
+from src import config as app_config
+from src import db as app_db
+
 # --- USER PHYSIOLOGY & PATH SETTINGS ---
-FTP = 250          # Functional Threshold Power in Watts
-MAX_HR = 185       # Maximum Heart Rate in bpm
-STRAVA_DIR = Path("./strava_export")
-OUTPUT_CSV = Path("./enriched_activities.csv")
-TOKEN_FILE = Path("./.strava_tokens.json")
+FTP = app_config.FTP              # Functional Threshold Power in Watts
+MAX_HR = app_config.MAX_HR        # Maximum Heart Rate in bpm
+STRAVA_DIR = app_config.STRAVA_DIR
+OUTPUT_CSV = app_config.CSV_PATH
+TOKEN_FILE = app_config.TOKEN_FILE
 
 # Strava API Credentials (can be set via environment variables or inside .strava_tokens.json)
-STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID", "")
-STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET", "")
-STRAVA_REFRESH_TOKEN = os.getenv("STRAVA_REFRESH_TOKEN", "")
+STRAVA_CLIENT_ID = app_config.STRAVA_CLIENT_ID
+STRAVA_CLIENT_SECRET = app_config.STRAVA_CLIENT_SECRET
+STRAVA_REFRESH_TOKEN = app_config.STRAVA_REFRESH_TOKEN
 
 BASE_COLS = [
     "Activity ID", "Activity Date", "Activity Name", "Activity Type",
@@ -361,7 +364,7 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
 
     if not new_summaries:
         print("All recent Strava activities are already present in the dataset.")
-        return
+        return {"fetched": 0, "db_inserted": 0, "total_csv_rows": len(existing_df)}
 
     # Process oldest-to-newest so chronological order is preserved when appending
     new_summaries.sort(key=lambda x: x.get("start_date", ""))
@@ -422,8 +425,18 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
     else:
         combined_df = new_df[final_cols]
 
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     combined_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Appended {len(new_df)} new activities to {OUTPUT_CSV} (Total rows: {len(combined_df)}).")
+    db_inserted = app_db.insert_activities(new_rows)
+    print(
+        f"Appended {len(new_df)} new activities to {OUTPUT_CSV} "
+        f"(Total rows: {len(combined_df)}, DB inserted: {db_inserted})."
+    )
+    return {
+        "fetched": len(new_df),
+        "db_inserted": db_inserted,
+        "total_csv_rows": len(combined_df),
+    }
 
 
 # =====================================================================
