@@ -1,7 +1,7 @@
 services:
-  strava-coach:
+  cycling-mcp:
     build: .
-    container_name: strava-ai-coach
+    container_name: cycling-mcp
     restart: unless-stopped
     ports:
       - "8050:8050"
@@ -16,3 +16,60 @@ services:
       - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID:-}
       - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET:-}
       - STRAVA_REFRESH_TOKEN=${STRAVA_REFRESH_TOKEN:-}
+    networks:
+      - coach_net
+
+  ts-cycling-coach:
+    image: tailscale/tailscale:latest
+    container_name: ts-cycling-coach
+    hostname: ${TS_HOSTNAME:-cycling-coach}
+    restart: unless-stopped
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--accept-dns=true
+    volumes:
+      - ./server/tailscale:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    networks:
+      - coach_net
+      # Optional: attach a macvlan network if a dedicated local LAN IP on port 80 is desired:
+      # lan_macvlan:
+      #   ipv4_address: 192.168.1.250
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: cycling-webui
+    network_mode: "service:ts-cycling-coach"
+    depends_on:
+      - ts-cycling-coach
+      - cycling-mcp
+    restart: unless-stopped
+    environment:
+      - PORT=80
+      - WEBUI_NAME=Strava Cycling Coach
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-to-a-long-random-secret}
+      - ENABLE_OPENAI_API=true
+      - OPENAI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      - OPENAI_API_KEY=${GEMINI_API_KEY}
+      - DEFAULT_MODELS=gemini-2.5-pro
+      - ENABLE_OLLAMA_API=false
+    volumes:
+      - ./server/open-webui:/app/backend/data
+
+networks:
+  coach_net:
+    driver: bridge
+  # Optional macvlan example for a dedicated local LAN IP:
+  lan_macvlan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.1

@@ -5,10 +5,14 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Any
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 
 from src import config, db, scheduler
 
@@ -212,22 +216,40 @@ def query_training_database(sql_query: str) -> dict[str, Any]:
         return {"error": f"SQLite error: {exc}"}
 
 
+@asynccontextmanager
+async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
+    """Manage the background Strava scheduler and FastMCP session manager."""
+    sched = scheduler.start_scheduler(run_on_startup=True)
+    try:
+        async with mcp.session_manager.run():
+            yield
+    finally:
+        scheduler.stop_scheduler(sched)
+
+
+def create_app() -> Starlette:
+    """Build the combined ASGI app exposing Streamable HTTP (/mcp) and SSE (/sse)."""
+    http_app = mcp.streamable_http_app()
+    sse_app = mcp.sse_app()
+    return Starlette(
+        routes=[*http_app.routes, *sse_app.routes],
+        lifespan=_lifespan,
+    )
+
+
 def main() -> None:
-    """Start background Strava scheduler and run FastMCP over SSE/HTTP."""
+    """Start background Strava scheduler and run FastMCP over Streamable HTTP and SSE."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    sched = scheduler.start_scheduler(run_on_startup=True)
-    try:
-        logger.info(
-            "Starting StravaCyclingCoach FastMCP server on %s:%s (SSE)...",
-            config.MCP_HOST,
-            config.MCP_PORT,
-        )
-        mcp.run(transport="sse")
-    finally:
-        scheduler.stop_scheduler(sched)
+    logger.info(
+        "Starting StravaCyclingCoach FastMCP server on %s:%s (Streamable HTTP /mcp & SSE /sse)...",
+        config.MCP_HOST,
+        config.MCP_PORT,
+    )
+    app = create_app()
+    uvicorn.run(app, host=config.MCP_HOST, port=config.MCP_PORT)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Strava AI Cycling Coach & MCP Server
 
-Ingests Strava cycling activities (from historical `.fit` / `.fit.gz` bulk exports and live Strava v3 API streams), computes power/heart-rate training metrics, stores them in SQLite (`server/cycling.db`) and CSV (`server/enriched_activities.csv`), and exposes your dataset alongside `server/playbook.md` over a **FastMCP** SSE server.
+Ingests Strava cycling activities (from historical `.fit` / `.fit.gz` bulk exports and live Strava v3 API streams), computes power/heart-rate training metrics, stores them in SQLite (`server/cycling.db`) and CSV (`server/enriched_activities.csv`), and exposes your dataset alongside `server/playbook.md` over a **FastMCP** server (Streamable HTTP `/mcp` and SSE `/sse`).
 
 ---
 
@@ -108,7 +108,7 @@ python -m src.mcp_server
 On startup, the server:
 1. Seeds `server/cycling.db` from `server/enriched_activities.csv`.
 2. Starts the APScheduler background worker (runs an immediate Strava API sync and schedules daily syncs at `SYNC_CRON_HOUR`, default `02:00`).
-3. Serves the FastMCP SSE endpoint at `http://localhost:8050/sse`.
+3. Serves the FastMCP endpoints at `http://localhost:8050/mcp` (Streamable HTTP) and `http://localhost:8050/sse` (SSE).
 
 ### 7. Connect Your MCP Client (Antigravity)
 Add the local SSE URL to your Antigravity MCP settings:
@@ -137,12 +137,49 @@ Available MCP tools and resources:
    If you placed your unzipped Strava bulk export at `./server/strava_export/` instead of copying a pre-built `enriched_activities.csv`, run the bulk ingestion in a one-off container before starting the service (or `exec` into the running container):
    ```bash
    # Before `docker compose up -d`:
-   docker compose run --rm strava-coach python analyse-activities.py --mode bulk
+   docker compose run --rm cycling-mcp python analyse-activities.py --mode bulk
    docker compose up -d --build
    ```
    If the container is already running, run bulk ingestion and then seed/restart so `cycling.db` picks up the new CSV:
    ```bash
-   docker compose exec strava-coach python analyse-activities.py --mode bulk
-   docker compose exec strava-coach python -c "from src import db; print('Inserted rows:', db.seed_from_csv())"
+   docker compose exec cycling-mcp python analyse-activities.py --mode bulk
+   docker compose exec cycling-mcp python -c "from src import db; print('Inserted rows:', db.seed_from_csv())"
    ```
 4. Add the MCP server URL (`http://<debian-server-ip>:8050/sse`) to your Antigravity MCP settings.
+
+---
+
+## Mobile Setup (Tailscale + Open WebUI)
+
+`docker-compose.yml` includes a dedicated Tailscale sidecar (`ts-cycling-coach`) and Open WebUI (`open-webui`) listening on port `80` inside the sidecar's network namespace. This gives the chat UI its own Tailscale hostname (`http://cycling-coach`) without conflicting with port `80` on the Debian host.
+
+1. **Configure `.env`:**
+   Copy `.env.example` to `.env` and set:
+   - `TS_AUTHKEY` — A Tailscale auth key (reusable or one-off, from the Tailscale Admin Console)
+   - `TS_HOSTNAME` — Tailscale node name (defaults to `cycling-coach`)
+   - `GEMINI_API_KEY` — Your Google Gemini API key
+   - `WEBUI_SECRET_KEY` — A long random string (required so Open WebUI persists MCP tool connections across restarts)
+
+2. **Start the stack and open the UI:**
+   ```bash
+   docker compose up -d --build
+   ```
+   From any phone or desktop on your Tailscale tailnet, open `http://cycling-coach` and create your admin account.
+
+3. **Connect the Strava Cycling Coach MCP server:**
+   In Open WebUI, go to **Admin Panel → Settings → External Tools → Add Server** (`+`):
+   - **Type:** `MCP (Streamable HTTP)`
+   - **URL:** `http://cycling-mcp:8050/mcp`
+   - **Auth:** `None`
+   Save and verify the connection discovers the tools (`get_training_playbook`, `get_current_readiness`, `get_recent_activities`, `sync_strava_now`, `query_training_database`).
+
+4. **Create a "Cycling Coach" custom model preset:**
+   Go to **Workspace → Models → Create a Model**:
+   - **Name:** `Cycling Coach`
+   - **Base Model:** `gemini-2.5-pro`
+   - **Tools:** Enable the Strava Cycling Coach MCP server added in step 3
+   - **System Prompt:**
+     ```text
+     You are my personal AI cycling coach. Whenever I ask for cycling or Zwift training advice, session recommendations, or recovery guidance, ALWAYS call get_training_playbook(), get_current_readiness(), and get_recent_activities(days=10) first. Base all target wattages on my rolling effective_ftp and heart rate caps on effective_max_hr.
+     ```
+   Save the model and select **Cycling Coach** for mobile and desktop coaching chats.
