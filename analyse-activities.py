@@ -14,9 +14,9 @@ import requests
 from src import config as app_config
 from src import db as app_db
 
-# --- USER PHYSIOLOGY & PATH SETTINGS ---
-FTP = app_config.FTP              # Functional Threshold Power in Watts
-MAX_HR = app_config.MAX_HR        # Maximum Heart Rate in bpm
+# --- COLD-START PHYSIOLOGY & PATH SETTINGS ---
+DEFAULT_FTP = app_config.DEFAULT_FTP        # Cold-start Functional Threshold Power in Watts
+DEFAULT_MAX_HR = app_config.DEFAULT_MAX_HR  # Cold-start Maximum Heart Rate in bpm
 STRAVA_DIR = app_config.STRAVA_DIR
 OUTPUT_CSV = app_config.CSV_PATH
 TOKEN_FILE = app_config.TOKEN_FILE
@@ -35,6 +35,7 @@ BASE_COLS = [
 
 METRIC_COLS = [
     "fit_lap_count",
+    "effective_ftp", "effective_max_hr",
     "hr_z1_pct", "hr_z2_pct", "hr_z3_pct", "hr_z4_pct", "hr_z5_pct",
     "avg_power_fit", "normalized_power", "intensity_factor", "variability_index",
     "pwr_z1_pct", "pwr_z2_pct", "pwr_z3_pct", "pwr_z4_pct", "pwr_z5_plus_pct",
@@ -46,28 +47,169 @@ METRIC_COLS = [
 # =====================================================================
 # 1. CORE METRIC ENGINE (Shared by FIT Parser and Strava API Streams)
 # =====================================================================
-def compute_stream_metrics(df: pd.DataFrame, lap_count: int = 0) -> dict:
+def extract_stream_peaks(df: pd.DataFrame) -> dict:
+    """
+    Extracts raw power peaks (1m, 5m, 20m) and a spike-filtered 5-second rolling
+    mean clean_max_hr (bounded between 135 and 208 bpm) from a 1Hz stream DataFrame.
+    """
+    peaks = {
+        "peak_1m_w": np.nan,
+        "peak_5m_w": np.nan,
+        "peak_20m_w": np.nan,
+        "clean_max_hr": np.nan,
+    }
+    if df.empty:
+        return peaks
+
+    pwr = pd.to_numeric(df["power"], errors="coerce").dropna()
+    if len(pwr) > 0:
+        for label, secs in [("peak_1m_w", 60), ("peak_5m_w", 300), ("peak_20m_w", 1200)]:
+            if len(pwr) >= secs:
+                peaks[label] = round(float(pwr.rolling(window=secs).mean().max()), 1)
+
+    hr = pd.to_numeric(df["hr"], errors="coerce").dropna()
+    if len(hr) >= 5:
+        hr_5s = hr.rolling(window=5, min_periods=5).mean().dropna()
+        hr_5s_bounded = hr_5s[(hr_5s >= 135) & (hr_5s <= 208)]
+        if not hr_5s_bounded.empty:
+            peaks["clean_max_hr"] = round(float(hr_5s_bounded.max()), 1)
+
+    return peaks
+
+
+def _valid_num(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return None if np.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_dynamic_physiology(
+    activity_ts: pd.Timestamp | None,
+    history_records: list[dict],
+    current_peaks: dict | None = None,
+    last_known_ftp: int | None = None,
+) -> tuple[int, int]:
+    """
+    Resolves (effective_ftp, effective_max_hr) using trailing rolling windows:
+      - effective_ftp: round(max(0.95 * peak_20m_w, 0.80 * peak_5m_w)) over trailing 90 days
+        up to activity_ts (inclusive of current_peaks), carrying forward last_known_ftp
+        if no power peaks exist in the 90-day window, then falling back to DEFAULT_FTP.
+      - effective_max_hr: max of valid HR (135 <= hr <= 208) over trailing 365 days
+        up to activity_ts (inclusive of current_peaks), falling back to DEFAULT_MAX_HR.
+    """
+    current_peaks = current_peaks or {}
+
+    if activity_ts is None or pd.isna(activity_ts):
+        ftp_candidates = []
+        p20 = _valid_num(current_peaks.get("peak_20m_w"))
+        p5 = _valid_num(current_peaks.get("peak_5m_w"))
+        if p20 and p20 > 0:
+            ftp_candidates.append(0.95 * p20)
+        if p5 and p5 > 0:
+            ftp_candidates.append(0.80 * p5)
+        eff_ftp = int(round(max(ftp_candidates))) if ftp_candidates else (last_known_ftp or DEFAULT_FTP)
+
+        hr_candidates = [
+            h for h in (_valid_num(current_peaks.get("clean_max_hr")), _valid_num(current_peaks.get("max_hr")))
+            if h is not None and 135 <= h <= 208
+        ]
+        eff_max_hr = int(round(max(hr_candidates))) if hr_candidates else DEFAULT_MAX_HR
+        return eff_ftp, eff_max_hr
+
+    ftp_cutoff = activity_ts - pd.Timedelta(days=90)
+    hr_cutoff = activity_ts - pd.Timedelta(days=365)
+
+    ftp_candidates: list[float] = []
+    hr_candidates: list[float] = []
+    latest_hist_ftp: int | None = last_known_ftp
+
+    for rec in history_records:
+        rec_ts = rec.get("ts")
+        if rec_ts is None or pd.isna(rec_ts) or rec_ts > activity_ts:
+            continue
+
+        rec_ftp = _valid_num(rec.get("effective_ftp"))
+        if rec_ftp and rec_ftp > 0:
+            latest_hist_ftp = int(round(rec_ftp))
+
+        if rec_ts >= ftp_cutoff:
+            p20 = _valid_num(rec.get("peak_20m_w"))
+            p5 = _valid_num(rec.get("peak_5m_w"))
+            if p20 and p20 > 0:
+                ftp_candidates.append(0.95 * p20)
+            if p5 and p5 > 0:
+                ftp_candidates.append(0.80 * p5)
+
+        if rec_ts >= hr_cutoff:
+            for key in ("clean_max_hr", "max_hr", "Max Heart Rate"):
+                h = _valid_num(rec.get(key))
+                if h is not None and 135 <= h <= 208:
+                    hr_candidates.append(h)
+
+    p20_cur = _valid_num(current_peaks.get("peak_20m_w"))
+    p5_cur = _valid_num(current_peaks.get("peak_5m_w"))
+    if p20_cur and p20_cur > 0:
+        ftp_candidates.append(0.95 * p20_cur)
+    if p5_cur and p5_cur > 0:
+        ftp_candidates.append(0.80 * p5_cur)
+
+    for key in ("clean_max_hr", "max_hr", "Max Heart Rate"):
+        h_cur = _valid_num(current_peaks.get(key))
+        if h_cur is not None and 135 <= h_cur <= 208:
+            hr_candidates.append(h_cur)
+
+    if ftp_candidates:
+        eff_ftp = int(round(max(ftp_candidates)))
+    elif latest_hist_ftp and latest_hist_ftp > 0:
+        eff_ftp = int(latest_hist_ftp)
+    else:
+        eff_ftp = DEFAULT_FTP
+
+    eff_max_hr = int(round(max(hr_candidates))) if hr_candidates else DEFAULT_MAX_HR
+    return eff_ftp, eff_max_hr
+
+
+def compute_stream_metrics(
+    df: pd.DataFrame,
+    lap_count: int = 0,
+    effective_ftp: int | None = None,
+    effective_max_hr: int | None = None,
+    peaks: dict | None = None,
+) -> dict:
     """
     Computes training metrics from a 1Hz DataFrame containing:
     ['hr', 'power', 'cadence', 'speed', 'altitude']
     """
+    ftp = int(effective_ftp) if effective_ftp and effective_ftp > 0 else DEFAULT_FTP
+    max_hr = int(effective_max_hr) if effective_max_hr and effective_max_hr > 0 else DEFAULT_MAX_HR
+
     metrics = {col: np.nan for col in METRIC_COLS}
     metrics["fit_lap_count"] = lap_count
+    metrics["effective_ftp"] = ftp
+    metrics["effective_max_hr"] = max_hr
 
     if df.empty:
         return metrics
 
+    extracted_peaks = peaks if peaks is not None else extract_stream_peaks(df)
+    for label in ("peak_1m_w", "peak_5m_w", "peak_20m_w"):
+        metrics[label] = extracted_peaks.get(label, np.nan)
+
     # 1. Heart Rate Zones & Distribution (% of recorded samples)
     hr = pd.to_numeric(df["hr"], errors="coerce").dropna()
     if len(hr) > 60:
-        hr_pct = hr / MAX_HR
+        hr_pct = hr / max_hr
         metrics["hr_z1_pct"] = round((hr_pct < 0.60).mean() * 100, 1)
         metrics["hr_z2_pct"] = round(((hr_pct >= 0.60) & (hr_pct < 0.70)).mean() * 100, 1)
         metrics["hr_z3_pct"] = round(((hr_pct >= 0.70) & (hr_pct < 0.80)).mean() * 100, 1)
         metrics["hr_z4_pct"] = round(((hr_pct >= 0.80) & (hr_pct < 0.90)).mean() * 100, 1)
         metrics["hr_z5_pct"] = round((hr_pct >= 0.90).mean() * 100, 1)
 
-    # 2. Power Metrics: NP, IF, VI, Zones, Peak Powers & HIIT Surges
+    # 2. Power Metrics: NP, IF, VI, Zones & HIIT Surges
     pwr = pd.to_numeric(df["power"], errors="coerce").dropna()
     if len(pwr) > 60:
         avg_pwr = pwr.mean()
@@ -76,24 +218,19 @@ def compute_stream_metrics(df: pd.DataFrame, lap_count: int = 0) -> dict:
 
         metrics["avg_power_fit"] = round(avg_pwr, 1)
         metrics["normalized_power"] = round(np_watts, 1)
-        metrics["intensity_factor"] = round(np_watts / FTP, 2)
+        metrics["intensity_factor"] = round(np_watts / ftp, 2)
         metrics["variability_index"] = round(np_watts / avg_pwr, 2) if avg_pwr > 0 else np.nan
 
         # Power Zones (% of time)
-        pwr_pct = pwr / FTP
+        pwr_pct = pwr / ftp
         metrics["pwr_z1_pct"] = round((pwr_pct < 0.55).mean() * 100, 1)
         metrics["pwr_z2_pct"] = round(((pwr_pct >= 0.55) & (pwr_pct < 0.75)).mean() * 100, 1)
         metrics["pwr_z3_pct"] = round(((pwr_pct >= 0.75) & (pwr_pct < 0.90)).mean() * 100, 1)
         metrics["pwr_z4_pct"] = round(((pwr_pct >= 0.90) & (pwr_pct < 1.05)).mean() * 100, 1)
         metrics["pwr_z5_plus_pct"] = round((pwr_pct >= 1.05).mean() * 100, 1)
 
-        # Rolling Peak Power Efforts (1m, 5m, 20m)
-        for label, secs in [("peak_1m_w", 60), ("peak_5m_w", 300), ("peak_20m_w", 1200)]:
-            if len(pwr) >= secs:
-                metrics[label] = round(pwr.rolling(window=secs).mean().max(), 1)
-
         # HIIT / Surge Counter (Distinct efforts > 120% FTP lasting at least 15 seconds)
-        above_120 = (pwr > (FTP * 1.20)).astype(int)
+        above_120 = (pwr > (ftp * 1.20)).astype(int)
         blocks = (above_120.diff() == 1).cumsum()
         surge_durations = above_120.groupby(blocks).sum()
         metrics["hiit_surges_count"] = int((surge_durations >= 15).sum())
@@ -126,10 +263,10 @@ def compute_stream_metrics(df: pd.DataFrame, lap_count: int = 0) -> dict:
 # =====================================================================
 # 2. SOURCE ADAPTER A: LOCAL .FIT / .FIT.GZ FILES
 # =====================================================================
-def parse_fit_metrics(file_path: Path) -> dict:
-    """Extracts second-by-second records from a .fit or .fit.gz file and computes training metrics."""
+def parse_fit_records(file_path: Path) -> tuple[pd.DataFrame, int]:
+    """Extracts second-by-second records and lap count from a .fit or .fit.gz file."""
     if not file_path.exists():
-        return {col: np.nan for col in METRIC_COLS}
+        return pd.DataFrame(), 0
 
     opener = gzip.open if file_path.suffix == ".gz" else open
     records = []
@@ -159,13 +296,40 @@ def parse_fit_metrics(file_path: Path) -> dict:
                             })
     except Exception as e:
         print(f"Warning: Could not parse {file_path.name}: {e}")
-        return {col: np.nan for col in METRIC_COLS}
+        return pd.DataFrame(), 0
 
     if not records:
-        return {col: np.nan for col in METRIC_COLS}
+        return pd.DataFrame(), lap_count
 
-    df = pd.DataFrame(records)
-    return compute_stream_metrics(df, lap_count=lap_count)
+    return pd.DataFrame(records), lap_count
+
+
+def parse_fit_metrics(
+    file_path: Path,
+    effective_ftp: int | None = None,
+    effective_max_hr: int | None = None,
+) -> dict:
+    """Extracts second-by-second records from a .fit or .fit.gz file and computes training metrics."""
+    df, lap_count = parse_fit_records(file_path)
+    if df.empty:
+        return {col: np.nan for col in METRIC_COLS}
+    return compute_stream_metrics(
+        df,
+        lap_count=lap_count,
+        effective_ftp=effective_ftp,
+        effective_max_hr=effective_max_hr,
+    )
+
+
+def _to_naive_ts(val) -> pd.Timestamp | None:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    ts = pd.to_datetime(val, errors="coerce")
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts
 
 
 def run_bulk_export():
@@ -175,27 +339,73 @@ def run_bulk_export():
         raise FileNotFoundError(f"Could not find {activities_csv}")
 
     base_df = pd.read_csv(activities_csv)
-    print(f"Loaded {len(base_df)} activities from activities.csv. Parsing FIT files...")
+    if "Activity Date" in base_df.columns:
+        base_df["_parsed_ts"] = pd.to_datetime(base_df["Activity Date"], errors="coerce")
+        base_df = base_df.sort_values("_parsed_ts", kind="mergesort", na_position="last").reset_index(drop=True)
+    else:
+        base_df["_parsed_ts"] = pd.NaT
 
+    print(f"Loaded {len(base_df)} activities from activities.csv (sorted chronologically). Parsing FIT files...")
+
+    history_records: list[dict] = []
+    last_known_ftp: int | None = None
     enriched_rows = []
+
     for idx, row in base_df.iterrows():
         rel_filename = str(row.get("Filename", "")).strip()
-        fit_metrics = {col: np.nan for col in METRIC_COLS}
+        row_ts = _to_naive_ts(row.get("_parsed_ts"))
 
+        stream_df = pd.DataFrame()
+        lap_count = 0
         if rel_filename and rel_filename != "nan":
             target_path = STRAVA_DIR / rel_filename
             if target_path.name.endswith((".fit", ".fit.gz")):
-                fit_metrics = parse_fit_metrics(target_path)
+                stream_df, lap_count = parse_fit_records(target_path)
 
+        peaks = extract_stream_peaks(stream_df)
+        if _valid_num(peaks.get("clean_max_hr")) is None:
+            peaks["max_hr"] = _valid_num(row.get("Max Heart Rate"))
+
+        eff_ftp, eff_max_hr = resolve_dynamic_physiology(
+            activity_ts=row_ts,
+            history_records=history_records,
+            current_peaks=peaks,
+            last_known_ftp=last_known_ftp,
+        )
+
+        if stream_df.empty:
+            fit_metrics = {col: np.nan for col in METRIC_COLS}
+            fit_metrics["effective_ftp"] = eff_ftp
+            fit_metrics["effective_max_hr"] = eff_max_hr
+        else:
+            fit_metrics = compute_stream_metrics(
+                stream_df,
+                lap_count=lap_count,
+                effective_ftp=eff_ftp,
+                effective_max_hr=eff_max_hr,
+                peaks=peaks,
+            )
+
+        last_known_ftp = eff_ftp
+        history_records.append({
+            "ts": row_ts,
+            "peak_20m_w": peaks.get("peak_20m_w"),
+            "peak_5m_w": peaks.get("peak_5m_w"),
+            "clean_max_hr": peaks.get("clean_max_hr"),
+            "Max Heart Rate": row.get("Max Heart Rate"),
+            "effective_ftp": eff_ftp,
+        })
         enriched_rows.append(fit_metrics)
 
         if (idx + 1) % 100 == 0:
             print(f"Processed {idx + 1}/{len(base_df)} activities...")
 
+    base_df = base_df.drop(columns=["_parsed_ts"], errors="ignore")
     fit_df = pd.DataFrame(enriched_rows, columns=METRIC_COLS)
     enriched_df = pd.concat([base_df.reset_index(drop=True), fit_df], axis=1)
 
     final_cols = [c for c in BASE_COLS if c in enriched_df.columns] + METRIC_COLS
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     enriched_df[final_cols].to_csv(OUTPUT_CSV, index=False)
     print(f"Done! Saved bulk enriched dataset to {OUTPUT_CSV} ({len(final_cols)} columns).")
 
@@ -370,6 +580,25 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
     new_summaries.sort(key=lambda x: x.get("start_date", ""))
     print(f"Found {len(new_summaries)} new activities to enrich.")
 
+    history_records: list[dict] = []
+    last_known_ftp: int | None = None
+    if not existing_df.empty and "Activity Date" in existing_df.columns:
+        hist_df = existing_df.copy()
+        hist_df["_ts"] = pd.to_datetime(hist_df["Activity Date"], errors="coerce")
+        hist_df = hist_df.sort_values("_ts", kind="mergesort", na_position="last")
+        for _, hrow in hist_df.iterrows():
+            hts = _to_naive_ts(hrow.get("_ts"))
+            h_ftp = _valid_num(hrow.get("effective_ftp"))
+            if h_ftp and h_ftp > 0:
+                last_known_ftp = int(round(h_ftp))
+            history_records.append({
+                "ts": hts,
+                "peak_20m_w": hrow.get("peak_20m_w"),
+                "peak_5m_w": hrow.get("peak_5m_w"),
+                "Max Heart Rate": hrow.get("Max Heart Rate"),
+                "effective_ftp": h_ftp,
+            })
+
     new_rows = []
     for idx, summary in enumerate(new_summaries, start=1):
         act_id = int(summary["id"])
@@ -390,7 +619,34 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
             },
         )
         stream_df = streams_to_dataframe(streams)
-        metrics = compute_stream_metrics(stream_df, lap_count=lap_count)
+        peaks = extract_stream_peaks(stream_df)
+        if _valid_num(peaks.get("clean_max_hr")) is None:
+            peaks["max_hr"] = _valid_num(detail.get("max_heartrate"))
+
+        act_ts = _to_naive_ts(detail.get("start_date"))
+        eff_ftp, eff_max_hr = resolve_dynamic_physiology(
+            activity_ts=act_ts,
+            history_records=history_records,
+            current_peaks=peaks,
+            last_known_ftp=last_known_ftp,
+        )
+        metrics = compute_stream_metrics(
+            stream_df,
+            lap_count=lap_count,
+            effective_ftp=eff_ftp,
+            effective_max_hr=eff_max_hr,
+            peaks=peaks,
+        )
+
+        last_known_ftp = eff_ftp
+        history_records.append({
+            "ts": act_ts,
+            "peak_20m_w": peaks.get("peak_20m_w"),
+            "peak_5m_w": peaks.get("peak_5m_w"),
+            "clean_max_hr": peaks.get("clean_max_hr"),
+            "Max Heart Rate": detail.get("max_heartrate"),
+            "effective_ftp": eff_ftp,
+        })
 
         # 3. Map base metadata to match Strava bulk export CSV columns
         base_metadata = {

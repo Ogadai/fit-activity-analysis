@@ -31,6 +31,8 @@ BASE_COLS: list[str] = [
 
 METRIC_COLS: list[str] = [
     "fit_lap_count",
+    "effective_ftp",
+    "effective_max_hr",
     "hr_z1_pct",
     "hr_z2_pct",
     "hr_z3_pct",
@@ -61,7 +63,13 @@ DERIVED_COLS: list[str] = [
 
 ALL_COLS: list[str] = BASE_COLS + METRIC_COLS + DERIVED_COLS
 
-_INT_COLS = {"Activity ID", "fit_lap_count", "hiit_surges_count"}
+_INT_COLS = {
+    "Activity ID",
+    "fit_lap_count",
+    "effective_ftp",
+    "effective_max_hr",
+    "hiit_surges_count",
+}
 _TEXT_COLS = {
     "Activity Date",
     "Activity Name",
@@ -103,6 +111,13 @@ def init_db(db_path: Path | None = None) -> None:
     """
     with get_connection(db_path) as conn:
         conn.executescript(ddl)
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(activities)").fetchall()
+        }
+        for col_name in ("effective_ftp", "effective_max_hr"):
+            if col_name not in existing_cols:
+                conn.execute(f'ALTER TABLE activities ADD COLUMN "{col_name}" INTEGER;')
+        conn.commit()
 
 
 def _clean_value(val: Any, col: str) -> Any:
@@ -141,7 +156,8 @@ def parse_activity_timestamp(raw_date: Any) -> tuple[str | None, str | None]:
 
 def compute_tss(row: dict[str, Any], ftp: int | None = None) -> float | None:
     """Compute Coggan Training Stress Score (TSS) from activity power and duration."""
-    effective_ftp = ftp or config.FTP
+    row_ftp = _clean_value(row.get("effective_ftp"), "effective_ftp")
+    effective_ftp = ftp or row_ftp or config.DEFAULT_FTP
     if effective_ftp <= 0:
         return None
 
@@ -209,6 +225,95 @@ def insert_activities(rows: list[dict[str, Any]], db_path: Path | None = None) -
         return conn.total_changes - before
 
 
+def _backfill_dynamic_physiology(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Chronologically backfill missing effective_ftp and effective_max_hr from
+    peak_20m_w, peak_5m_w, and Max Heart Rate, and recalculate intensity_factor
+    and tss using effective_ftp.
+    """
+    work = df.copy()
+    if "Activity Date" in work.columns:
+        work["_ts"] = pd.to_datetime(work["Activity Date"], errors="coerce")
+        if work["_ts"].dt.tz is not None:
+            work["_ts"] = work["_ts"].dt.tz_localize(None)
+        work = work.sort_values("_ts", kind="mergesort", na_position="last").reset_index(drop=True)
+    else:
+        work["_ts"] = pd.NaT
+
+    history: list[dict[str, Any]] = []
+    last_known_ftp: int | None = None
+
+    for idx, row in work.iterrows():
+        ts = row["_ts"]
+        has_ts = pd.notna(ts)
+
+        existing_eff_ftp = _clean_value(row.get("effective_ftp"), "effective_ftp")
+        existing_eff_hr = _clean_value(row.get("effective_max_hr"), "effective_max_hr")
+
+        p20_cur = _clean_value(row.get("peak_20m_w"), "peak_20m_w")
+        p5_cur = _clean_value(row.get("peak_5m_w"), "peak_5m_w")
+        hr_cur = _clean_value(row.get("Max Heart Rate"), "Max Heart Rate")
+
+        if existing_eff_ftp is None:
+            ftp_candidates: list[float] = []
+            if has_ts:
+                ftp_cutoff = ts - timedelta(days=90)
+                for h in history:
+                    hts = h["ts"]
+                    if hts is not None and ftp_cutoff <= hts <= ts:
+                        if h["p20"] and h["p20"] > 0:
+                            ftp_candidates.append(0.95 * h["p20"])
+                        if h["p5"] and h["p5"] > 0:
+                            ftp_candidates.append(0.80 * h["p5"])
+            if p20_cur and p20_cur > 0:
+                ftp_candidates.append(0.95 * p20_cur)
+            if p5_cur and p5_cur > 0:
+                ftp_candidates.append(0.80 * p5_cur)
+
+            if ftp_candidates:
+                eff_ftp = int(round(max(ftp_candidates)))
+            elif last_known_ftp and last_known_ftp > 0:
+                eff_ftp = int(last_known_ftp)
+            else:
+                eff_ftp = config.DEFAULT_FTP
+
+            work.at[idx, "effective_ftp"] = eff_ftp
+
+            np_val = _clean_value(row.get("normalized_power"), "normalized_power")
+            if np_val and np_val > 0 and eff_ftp > 0:
+                work.at[idx, "intensity_factor"] = round(np_val / float(eff_ftp), 2)
+
+            row_dict = work.loc[idx].to_dict()
+            work.at[idx, "tss"] = compute_tss(row_dict, ftp=eff_ftp)
+        else:
+            eff_ftp = int(existing_eff_ftp)
+
+        if existing_eff_hr is None:
+            hr_candidates: list[float] = []
+            if has_ts:
+                hr_cutoff = ts - timedelta(days=365)
+                for h in history:
+                    hts = h["ts"]
+                    if hts is not None and hr_cutoff <= hts <= ts:
+                        if h["hr"] is not None and 135 <= h["hr"] <= 208:
+                            hr_candidates.append(h["hr"])
+            if hr_cur is not None and 135 <= hr_cur <= 208:
+                hr_candidates.append(hr_cur)
+
+            eff_hr = int(round(max(hr_candidates))) if hr_candidates else config.DEFAULT_MAX_HR
+            work.at[idx, "effective_max_hr"] = eff_hr
+
+        last_known_ftp = eff_ftp
+        history.append({
+            "ts": ts if has_ts else None,
+            "p20": p20_cur,
+            "p5": p5_cur,
+            "hr": hr_cur,
+        })
+
+    return work.drop(columns=["_ts"], errors="ignore")
+
+
 def seed_from_csv(
     csv_path: Path | None = None,
     db_path: Path | None = None,
@@ -222,6 +327,15 @@ def seed_from_csv(
     df = pd.read_csv(target_csv)
     if df.empty or "Activity ID" not in df.columns:
         return 0
+
+    needs_backfill = (
+        "effective_ftp" not in df.columns
+        or "effective_max_hr" not in df.columns
+        or df["effective_ftp"].isna().any()
+        or df["effective_max_hr"].isna().any()
+    )
+    if needs_backfill:
+        df = _backfill_dynamic_physiology(df)
 
     with get_connection(db_path) as conn:
         existing_ids = {
@@ -254,10 +368,19 @@ def compute_training_load(
     with get_connection(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT activity_date_iso, tss, peak_20m_w
+            SELECT
+                "Activity ID",
+                "Activity Name",
+                activity_date_iso,
+                tss,
+                peak_20m_w,
+                peak_5m_w,
+                "Max Heart Rate",
+                effective_ftp,
+                effective_max_hr
             FROM activities
             WHERE activity_date_iso IS NOT NULL
-            ORDER BY activity_date_iso ASC
+            ORDER BY activity_date_iso ASC, "Activity ID" ASC
             """
         ).fetchall()
         total_activities = conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
@@ -268,9 +391,12 @@ def compute_training_load(
             "ctl": 0.0,
             "atl": 0.0,
             "tsb": 0.0,
+            "effective_ftp": config.DEFAULT_FTP,
+            "effective_max_hr": config.DEFAULT_MAX_HR,
+            "peak_power_90d_source": None,
             "rolling_90d_ftp": None,
             "rolling_90d_peak_20m_w": None,
-            "configured_ftp": config.FTP,
+            "configured_ftp": config.DEFAULT_FTP,
             "total_activities": total_activities,
             "history": [],
         }
@@ -279,6 +405,10 @@ def compute_training_load(
     df["date"] = pd.to_datetime(df["activity_date_iso"]).dt.date
     df["tss"] = pd.to_numeric(df["tss"], errors="coerce").fillna(0.0)
     df["peak_20m_w"] = pd.to_numeric(df["peak_20m_w"], errors="coerce")
+    df["peak_5m_w"] = pd.to_numeric(df["peak_5m_w"], errors="coerce")
+    df["Max Heart Rate"] = pd.to_numeric(df["Max Heart Rate"], errors="coerce")
+    df["effective_ftp"] = pd.to_numeric(df["effective_ftp"], errors="coerce")
+    df["effective_max_hr"] = pd.to_numeric(df["effective_max_hr"], errors="coerce")
 
     start_dt = df["date"].min()
     if end_dt < start_dt:
@@ -306,8 +436,47 @@ def compute_training_load(
         )
         current_dt += timedelta(days=1)
 
-    window_start = end_dt - timedelta(days=89)
-    recent_peaks = df[(df["date"] >= window_start) & (df["date"] <= end_dt)]["peak_20m_w"].dropna()
+    window_90_start = end_dt - timedelta(days=89)
+    recent_90_df = df[(df["date"] >= window_90_start) & (df["date"] <= end_dt)]
+
+    best_ftp_est: float | None = None
+    peak_power_source: dict[str, Any] | None = None
+
+    for _, r in recent_90_df.iterrows():
+        p20 = r["peak_20m_w"]
+        p5 = r["peak_5m_w"]
+        if pd.notna(p20) and p20 > 0:
+            est = 0.95 * float(p20)
+            if best_ftp_est is None or est > best_ftp_est:
+                best_ftp_est = est
+                peak_power_source = {
+                    "date": r["activity_date_iso"],
+                    "activity_id": int(r["Activity ID"]),
+                    "activity_name": r["Activity Name"],
+                    "metric": "peak_20m_w",
+                    "watts": round(float(p20), 1),
+                    "estimated_ftp": int(round(est)),
+                }
+        if pd.notna(p5) and p5 > 0:
+            est = 0.80 * float(p5)
+            if best_ftp_est is None or est > best_ftp_est:
+                best_ftp_est = est
+                peak_power_source = {
+                    "date": r["activity_date_iso"],
+                    "activity_id": int(r["Activity ID"]),
+                    "activity_name": r["Activity Name"],
+                    "metric": "peak_5m_w",
+                    "watts": round(float(p5), 1),
+                    "estimated_ftp": int(round(est)),
+                }
+
+    if best_ftp_est is not None:
+        effective_ftp = int(round(best_ftp_est))
+    else:
+        prior_ftps = df[df["date"] <= end_dt]["effective_ftp"].dropna()
+        effective_ftp = int(round(float(prior_ftps.iloc[-1]))) if not prior_ftps.empty else config.DEFAULT_FTP
+
+    recent_peaks = recent_90_df["peak_20m_w"].dropna()
     if not recent_peaks.empty:
         peak_20m = round(float(recent_peaks.max()), 1)
         rolling_90d_ftp = round(0.95 * peak_20m, 1)
@@ -315,15 +484,33 @@ def compute_training_load(
         peak_20m = None
         rolling_90d_ftp = None
 
+    window_365_start = end_dt - timedelta(days=364)
+    recent_365_df = df[(df["date"] >= window_365_start) & (df["date"] <= end_dt)]
+    valid_hr_series = recent_365_df["Max Heart Rate"].dropna()
+    valid_hr_series = valid_hr_series[(valid_hr_series >= 135) & (valid_hr_series <= 208)]
+    if not valid_hr_series.empty:
+        effective_max_hr = int(round(float(valid_hr_series.max())))
+    else:
+        eff_hr_series = recent_365_df["effective_max_hr"].dropna()
+        eff_hr_series = eff_hr_series[(eff_hr_series >= 135) & (eff_hr_series <= 208)]
+        effective_max_hr = (
+            int(round(float(eff_hr_series.max())))
+            if not eff_hr_series.empty
+            else config.DEFAULT_MAX_HR
+        )
+
     latest = history[-1]
     return {
         "as_of_date": end_dt.isoformat(),
         "ctl": latest["ctl"],
         "atl": latest["atl"],
         "tsb": latest["tsb"],
+        "effective_ftp": effective_ftp,
+        "effective_max_hr": effective_max_hr,
+        "peak_power_90d_source": peak_power_source,
         "rolling_90d_ftp": rolling_90d_ftp,
         "rolling_90d_peak_20m_w": peak_20m,
-        "configured_ftp": config.FTP,
+        "configured_ftp": config.DEFAULT_FTP,
         "total_activities": total_activities,
         "history": history,
     }

@@ -3,9 +3,11 @@
 import os
 from pathlib import Path
 
-# Physiology settings
-FTP: int = int(os.getenv("FTP", "250"))
-MAX_HR: int = int(os.getenv("MAX_HR", "185"))
+# Cold-start physiology fallback settings (used only when no historical data exists)
+DEFAULT_FTP: int = int(os.getenv("FTP", "250"))
+DEFAULT_MAX_HR: int = int(os.getenv("MAX_HR", "185"))
+FTP: int = DEFAULT_FTP
+MAX_HR: int = DEFAULT_MAX_HR
 
 # Storage & data paths
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./server"))

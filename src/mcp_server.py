@@ -51,7 +51,8 @@ def get_training_playbook() -> str:
 def get_current_readiness() -> dict[str, Any]:
     """
     Compute current CTL (fitness), ATL (fatigue), TSB (form),
-    90-day rolling FTP, and the last 14 days of daily training load.
+    live rolling 90-day effective_ftp, 365-day effective_max_hr,
+    the source activity/date for the 90-day peak power, and the last 14 days of load.
     """
     load = db.compute_training_load()
     tsb = load["tsb"]
@@ -70,12 +71,42 @@ def get_current_readiness() -> dict[str, Any]:
         "atl": load["atl"],
         "tsb": tsb,
         "readiness_status": status,
+        "effective_ftp": load["effective_ftp"],
+        "effective_max_hr": load["effective_max_hr"],
+        "peak_power_90d_source": load["peak_power_90d_source"],
         "rolling_90d_ftp": load["rolling_90d_ftp"],
         "rolling_90d_peak_20m_w": load["rolling_90d_peak_20m_w"],
-        "configured_ftp": load["configured_ftp"],
+        "default_ftp": config.DEFAULT_FTP,
+        "default_max_hr": config.DEFAULT_MAX_HR,
         "total_activities": load["total_activities"],
         "recent_14d_load": load["history"][-14:],
     }
+
+
+@mcp.resource("coach://status-summary")
+def status_summary_resource() -> str:
+    """Live summary of CTL, ATL, TSB, rolling 90-day effective FTP, and 365-day Max HR."""
+    r = get_current_readiness()
+    peak = r["peak_power_90d_source"]
+    if peak:
+        peak_line = (
+            f"{peak['watts']} W ({peak['metric']}) on {peak['date']} "
+            f"— {peak['activity_name']} (ID: {peak['activity_id']})"
+        )
+    else:
+        peak_line = "No 5m/20m power peaks recorded in the last 90 days (using fallback/carry-forward)"
+
+    return (
+        f"# Cycling Readiness Summary ({r['as_of_date']})\n\n"
+        f"- **Readiness Status:** {r['readiness_status']}\n"
+        f"- **Fitness (CTL, 42d):** {r['ctl']}\n"
+        f"- **Fatigue (ATL, 7d):** {r['atl']}\n"
+        f"- **Form (TSB):** {r['tsb']}\n"
+        f"- **Effective FTP (90d rolling):** {r['effective_ftp']} W\n"
+        f"- **90d Peak Power Source:** {peak_line}\n"
+        f"- **Effective Max HR (365d rolling):** {r['effective_max_hr']} bpm\n"
+        f"- **Total Activities Indexed:** {r['total_activities']}\n"
+    )
 
 
 @mcp.tool()
