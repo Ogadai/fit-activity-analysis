@@ -1,0 +1,8 @@
+fitdecode
+numpy
+pandas
+requests
+mcp[cli]
+apscheduler
+uvicorn
+starlette

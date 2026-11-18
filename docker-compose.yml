@@ -1,0 +1,18 @@
+services:
+  strava-coach:
+    build: .
+    container_name: strava-ai-coach
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./server:/app/server
+    environment:
+      - DATA_DIR=/app/server
+      - MCP_PORT=${MCP_PORT:-8050}
+      - FTP=${FTP:-250}
+      - MAX_HR=${MAX_HR:-185}
+      - SYNC_CRON_HOUR=${SYNC_CRON_HOUR:-2}
+      - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID:-}
+      - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET:-}
+      - STRAVA_REFRESH_TOKEN=${STRAVA_REFRESH_TOKEN:-}

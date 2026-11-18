@@ -1,2 +1,5 @@
-/server
-
+server/*
+!server/.gitkeep
+.env
+__pycache__/
+*.py[cod]
