@@ -160,11 +160,32 @@ def _clean_value(val: Any, col: str) -> Any:
     except (TypeError, ValueError):
         pass
 
-    if col in _INT_COLS:
-        return int(float(val))
     if col in _TEXT_COLS:
         return str(val)
-    return float(val)
+
+    if isinstance(val, str):
+        val = val.strip().replace(",", "")
+        if not val or val.lower() == "nan":
+            return None
+
+    if col in _INT_COLS:
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(num) or math.isinf(num):
+        return None
+
+    if col in _INT_COLS:
+        return int(num)
+    return num
 
 
 def parse_activity_timestamp(raw_date: Any) -> tuple[str | None, str | None]:

@@ -80,6 +80,10 @@ def extract_stream_peaks(df: pd.DataFrame) -> dict:
 def _valid_num(val) -> float | None:
     if val is None:
         return None
+    if isinstance(val, str):
+        val = val.strip().replace(",", "")
+        if not val:
+            return None
     try:
         f = float(val)
         return None if np.isnan(f) else f
