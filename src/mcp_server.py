@@ -36,6 +36,7 @@ mcp = FastMCP(
     ),
     host=config.MCP_HOST,
     port=config.MCP_PORT,
+    stateless_http=True,
 )
 
 _MAX_QUERY_ROWS = 200

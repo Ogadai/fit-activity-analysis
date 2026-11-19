@@ -2,7 +2,7 @@ fitdecode
 numpy
 pandas
 requests
-mcp[cli]>=1.2.0,<2
+mcp[cli]>=1.8.0,<2
 apscheduler
 uvicorn
 starlette
