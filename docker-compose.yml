@@ -36,10 +36,9 @@ services:
       - NET_ADMIN
       - SYS_MODULE
     networks:
-      - coach_net
-      # Optional: attach a macvlan network if a dedicated local LAN IP on port 80 is desired:
-      # lan_macvlan:
-      #   ipv4_address: 192.168.1.250
+      coach_net: {}
+      lan_macvlan:
+        ipv4_address: ${LAN_IP:-192.168.1.250}
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -68,8 +67,8 @@ networks:
   lan_macvlan:
     driver: macvlan
     driver_opts:
-      parent: eth0
+      parent: ${LAN_PARENT_IFACE:-eth0}
     ipam:
       config:
-        - subnet: 192.168.1.0/24
-          gateway: 192.168.1.1
+        - subnet: ${LAN_SUBNET:-192.168.1.0/24}
+          gateway: ${LAN_GATEWAY:-192.168.1.1}
