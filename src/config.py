@@ -21,6 +21,11 @@ TOKEN_FILE: Path = Path(os.getenv("TOKEN_FILE", str(DATA_DIR / ".strava_tokens.j
 MCP_HOST: str = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT: int = int(os.getenv("MCP_PORT", "8050"))
 SYNC_CRON_HOUR: int = int(os.getenv("SYNC_CRON_HOUR", "2"))
+SYNC_SOURCE: str = os.getenv("SYNC_SOURCE", "auto").strip().lower()
+
+# Intervals.icu API credentials (Athlete ID '0' resolves to the API key owner)
+INTERVALS_API_KEY: str = os.getenv("INTERVALS_API_KEY", "")
+INTERVALS_ATHLETE_ID: str = os.getenv("INTERVALS_ATHLETE_ID", "0")
 
 # Strava API credentials (optional if provided in .strava_tokens.json)
 STRAVA_CLIENT_ID: str = os.getenv("STRAVA_CLIENT_ID", "")

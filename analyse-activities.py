@@ -1,9 +1,12 @@
 import argparse
 import gzip
+import hashlib
+import io
 import json
 import os
 import time
-from datetime import datetime
+import zipfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import fitdecode
@@ -25,6 +28,10 @@ TOKEN_FILE = app_config.TOKEN_FILE
 STRAVA_CLIENT_ID = app_config.STRAVA_CLIENT_ID
 STRAVA_CLIENT_SECRET = app_config.STRAVA_CLIENT_SECRET
 STRAVA_REFRESH_TOKEN = app_config.STRAVA_REFRESH_TOKEN
+
+# Intervals.icu API Credentials
+INTERVALS_API_KEY = app_config.INTERVALS_API_KEY
+INTERVALS_ATHLETE_ID = app_config.INTERVALS_ATHLETE_ID
 
 BASE_COLS = [
     "Activity ID", "Activity Date", "Activity Name", "Activity Type",
@@ -265,47 +272,85 @@ def compute_stream_metrics(
 
 
 # =====================================================================
-# 2. SOURCE ADAPTER A: LOCAL .FIT / .FIT.GZ FILES
+# 2. SOURCE ADAPTER A: LOCAL .FIT / .FIT.GZ FILES & RAW FIT BYTES
 # =====================================================================
-def parse_fit_records(file_path: Path) -> tuple[pd.DataFrame, int]:
-    """Extracts second-by-second records and lap count from a .fit or .fit.gz file."""
-    if not file_path.exists():
-        return pd.DataFrame(), 0
-
-    opener = gzip.open if file_path.suffix == ".gz" else open
+def _parse_fit_stream(stream, source_name: str = "stream") -> tuple[pd.DataFrame, int]:
+    """Extracts second-by-second records and lap count from a binary FIT file-like stream."""
     records = []
     lap_count = 0
 
     try:
-        with opener(file_path, "rb") as f:
-            with fitdecode.FitReader(f) as fit:
-                for frame in fit:
-                    if isinstance(frame, fitdecode.FitDataMessage):
-                        if frame.name == "lap":
-                            lap_count += 1
-                        elif frame.name == "record":
-                            records.append({
-                                "timestamp": frame.get_value("timestamp", fallback=None),
-                                "hr": frame.get_value("heart_rate", fallback=np.nan),
-                                "power": frame.get_value("power", fallback=np.nan),
-                                "cadence": frame.get_value("cadence", fallback=np.nan),
-                                "speed": frame.get_value(
-                                    "enhanced_speed",
-                                    fallback=frame.get_value("speed", fallback=np.nan)
-                                ),
-                                "altitude": frame.get_value(
-                                    "enhanced_altitude",
-                                    fallback=frame.get_value("altitude", fallback=np.nan)
-                                ),
-                            })
+        with fitdecode.FitReader(stream) as fit:
+            for frame in fit:
+                if isinstance(frame, fitdecode.FitDataMessage):
+                    if frame.name == "lap":
+                        lap_count += 1
+                    elif frame.name == "record":
+                        records.append({
+                            "timestamp": frame.get_value("timestamp", fallback=None),
+                            "hr": frame.get_value("heart_rate", fallback=np.nan),
+                            "power": frame.get_value("power", fallback=np.nan),
+                            "cadence": frame.get_value("cadence", fallback=np.nan),
+                            "speed": frame.get_value(
+                                "enhanced_speed",
+                                fallback=frame.get_value("speed", fallback=np.nan)
+                            ),
+                            "altitude": frame.get_value(
+                                "enhanced_altitude",
+                                fallback=frame.get_value("altitude", fallback=np.nan)
+                            ),
+                        })
     except Exception as e:
-        print(f"Warning: Could not parse {file_path.name}: {e}")
+        print(f"Warning: Could not parse {source_name}: {e}")
         return pd.DataFrame(), 0
 
     if not records:
         return pd.DataFrame(), lap_count
 
     return pd.DataFrame(records), lap_count
+
+
+def parse_fit_bytes(raw_bytes: bytes, source_name: str = "bytes") -> tuple[pd.DataFrame, int]:
+    """Extracts second-by-second records and lap count from raw .fit, .fit.gz, or .zip bytes."""
+    if not raw_bytes:
+        return pd.DataFrame(), 0
+
+    if raw_bytes[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                fit_names = [n for n in zf.namelist() if n.lower().endswith(".fit")]
+                if not fit_names:
+                    print(f"Warning: No .fit file found inside ZIP archive for {source_name}")
+                    return pd.DataFrame(), 0
+                with zf.open(fit_names[0]) as fit_member:
+                    return _parse_fit_stream(fit_member, source_name=fit_names[0])
+        except Exception as e:
+            print(f"Warning: Could not unpack ZIP for {source_name}: {e}")
+            return pd.DataFrame(), 0
+
+    if raw_bytes[:2] == b"\x1f\x8b":
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(raw_bytes)) as gz:
+                return _parse_fit_stream(gz, source_name=source_name)
+        except Exception as e:
+            print(f"Warning: Could not gunzip {source_name}: {e}")
+            return pd.DataFrame(), 0
+
+    return _parse_fit_stream(io.BytesIO(raw_bytes), source_name=source_name)
+
+
+def parse_fit_records(file_path: Path) -> tuple[pd.DataFrame, int]:
+    """Extracts second-by-second records and lap count from a .fit or .fit.gz file."""
+    if not file_path.exists():
+        return pd.DataFrame(), 0
+
+    opener = gzip.open if file_path.suffix == ".gz" else open
+    try:
+        with opener(file_path, "rb") as f:
+            return _parse_fit_stream(f, source_name=file_path.name)
+    except Exception as e:
+        print(f"Warning: Could not open {file_path.name}: {e}")
+        return pd.DataFrame(), 0
 
 
 def parse_fit_metrics(
@@ -474,21 +519,30 @@ class StravaAPIClient:
             },
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for {self.TOKEN_URL}: {resp.text[:300]}",
+                response=resp,
+            )
         self._save_tokens(resp.json())
         return self.access_token
 
     def get(self, endpoint: str, params: dict = None):
         token = self.ensure_access_token()
+        url = f"{self.BASE_URL}{endpoint}"
         resp = requests.get(
-            f"{self.BASE_URL}{endpoint}",
+            url,
             headers={"Authorization": f"Bearer {token}"},
             params=params,
             timeout=20,
         )
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}",
+                response=resp,
+            )
         return resp.json()
 
 
@@ -693,6 +747,7 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
         f"(Total rows: {len(combined_df)}, DB inserted: {db_inserted})."
     )
     return {
+        "source": "strava",
         "fetched": len(new_df),
         "db_inserted": db_inserted,
         "total_csv_rows": len(combined_df),
@@ -700,32 +755,384 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
 
 
 # =====================================================================
-# 4. CLI ENTRY POINT
+# 4. SOURCE ADAPTER C: INTERVALS.ICU REST API
+# =====================================================================
+class IntervalsAPIClient:
+    """Official Intervals.icu v1 REST API client using HTTP Basic Auth ('API_KEY': api_key)."""
+
+    BASE_URL = "https://intervals.icu/api/v1"
+
+    def __init__(self, api_key: str, athlete_id: str = "0"):
+        self.api_key = (api_key or "").strip()
+        self.athlete_id = (athlete_id or "0").strip() or "0"
+        if not self.api_key:
+            raise ValueError(
+                "Missing INTERVALS_API_KEY. Generate an API key in Intervals.icu "
+                "(Settings -> Developer Settings) and set INTERVALS_API_KEY in your environment or .env."
+            )
+        self.auth = ("API_KEY", self.api_key)
+
+    def get_json(self, endpoint: str, params: dict | None = None):
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = requests.get(url, auth=self.auth, params=params, timeout=25)
+        if resp.status_code == 404:
+            return None
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}",
+                response=resp,
+            )
+        return resp.json()
+
+    def get_bytes(self, endpoint: str, params: dict | None = None) -> bytes | None:
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = requests.get(url, auth=self.auth, params=params, timeout=30)
+        if resp.status_code in (404, 204):
+            return None
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}",
+                response=resp,
+            )
+        return resp.content
+
+
+def intervals_id_to_int(raw_id: str | int) -> int:
+    """
+    Maps an Intervals.icu activity ID (e.g. 'i55751783' or numeric string) to a deterministic
+    64-bit positive integer for SQLite's INTEGER PRIMARY KEY without colliding with Strava IDs.
+    """
+    text = str(raw_id).strip()
+    if text.isdigit():
+        return int(text)
+    if text.startswith("i") and text[1:].isdigit():
+        return 9_000_000_000_000 + int(text[1:])
+    return 8_000_000_000_000 + int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:5], "big")
+
+
+def intervals_streams_to_dataframe(streams_payload) -> pd.DataFrame:
+    """Converts Intervals.icu /activity/{id}/streams.json response into the standardized 1Hz DataFrame."""
+    if not streams_payload:
+        return pd.DataFrame()
+
+    # Intervals.icu returns either a list of {"type": ..., "data": [...]} or a dict keyed by stream type
+    if isinstance(streams_payload, list):
+        by_type = {
+            item.get("type"): item.get("data", [])
+            for item in streams_payload
+            if isinstance(item, dict) and item.get("type")
+        }
+    elif isinstance(streams_payload, dict):
+        by_type = {
+            k: (v.get("data", []) if isinstance(v, dict) else v)
+            for k, v in streams_payload.items()
+        }
+    else:
+        return pd.DataFrame()
+
+    if not by_type:
+        return pd.DataFrame()
+
+    n_samples = len(by_type.get("time") or next(iter(by_type.values()), []))
+    if n_samples == 0:
+        return pd.DataFrame()
+
+    def extract_col(*keys: str):
+        for k in keys:
+            vals = by_type.get(k)
+            if vals and len(vals) == n_samples:
+                return vals
+        return [np.nan] * n_samples
+
+    return pd.DataFrame({
+        "hr": extract_col("heartrate"),
+        "power": extract_col("watts"),
+        "cadence": extract_col("cadence"),
+        "speed": extract_col("velocity_smooth"),
+        "altitude": extract_col("altitude", "fixed_altitude"),
+    })
+
+
+def _is_duplicate_timestamp(
+    candidate_ts: pd.Timestamp | None,
+    existing_ts_list: list[pd.Timestamp],
+    tolerance_sec: int = 90,
+) -> bool:
+    """Returns True if candidate_ts falls within tolerance_sec of any timestamp in existing_ts_list."""
+    if candidate_ts is None or pd.isna(candidate_ts):
+        return False
+    for existing_ts in existing_ts_list:
+        if abs((candidate_ts - existing_ts).total_seconds()) <= tolerance_sec:
+            return True
+    return False
+
+
+def sync_recent_from_intervals(limit: int = 30, after_days: int | None = None) -> dict:
+    """
+    Fetches recent activities from Intervals.icu, downloads processed/original .fit files
+    (falling back to streams if needed), enriches them via the shared metric engine,
+    appends new rows to OUTPUT_CSV, and inserts them into SQLite.
+    Deduplicates against both Activity IDs and start timestamps (+/-90s) so historical
+    Strava rides are never duplicated.
+    """
+    api_key = INTERVALS_API_KEY or os.getenv("INTERVALS_API_KEY", "")
+    athlete_id = INTERVALS_ATHLETE_ID or os.getenv("INTERVALS_ATHLETE_ID", "0")
+    client = IntervalsAPIClient(api_key=api_key, athlete_id=athlete_id)
+
+    existing_df = pd.DataFrame()
+    existing_ids: set[int] = set()
+    existing_timestamps: list[pd.Timestamp] = []
+    if OUTPUT_CSV.exists():
+        existing_df = pd.read_csv(OUTPUT_CSV)
+        if "Activity ID" in existing_df.columns:
+            existing_ids = set(pd.to_numeric(existing_df["Activity ID"], errors="coerce").dropna().astype(int))
+        if "Activity Date" in existing_df.columns:
+            parsed_dates = pd.to_datetime(existing_df["Activity Date"], errors="coerce").dropna()
+            existing_timestamps = [ts.tz_localize(None) if ts.tzinfo is not None else ts for ts in parsed_dates]
+        print(f"Loaded existing dataset ({len(existing_df)} rows). Checking Intervals.icu for new activities...")
+    else:
+        print("No existing dataset found at OUTPUT_CSV. Creating new dataset from Intervals.icu...")
+
+    lookback_days = max(1, int(after_days)) if after_days else 90
+    newest_date = (date.today() + timedelta(days=1)).isoformat()
+    oldest_date = (date.today() - timedelta(days=lookback_days)).isoformat()
+
+    raw_activities = client.get_json(
+        f"/athlete/{client.athlete_id}/activities",
+        params={"oldest": oldest_date, "newest": newest_date},
+    ) or []
+
+    skipped_strava_stubs = 0
+    candidates = []
+    for act in raw_activities:
+        if not isinstance(act, dict) or not act.get("id"):
+            continue
+        start_iso = act.get("start_date") or act.get("start_date_local")
+        # Intervals.icu returns minimal stub objects (no start_date/name) for Strava-sourced activities
+        if not start_iso:
+            if str(act.get("source", "")).upper() == "STRAVA":
+                skipped_strava_stubs += 1
+            continue
+        candidates.append(act)
+
+    # Sort newest-first to respect `limit`, then filter out duplicates
+    candidates.sort(key=lambda x: x.get("start_date") or x.get("start_date_local") or "", reverse=True)
+    candidates = candidates[: max(1, min(int(limit), 200))]
+
+    new_summaries = []
+    for act in candidates:
+        int_id = intervals_id_to_int(act["id"])
+        if int_id in existing_ids:
+            continue
+        start_iso = act.get("start_date") or act.get("start_date_local")
+        act_ts = _to_naive_ts(start_iso)
+        if _is_duplicate_timestamp(act_ts, existing_timestamps, tolerance_sec=90):
+            continue
+        new_summaries.append(act)
+
+    if not new_summaries:
+        print(
+            f"All recent Intervals.icu activities are already present in the dataset "
+            f"(skipped_strava_stubs={skipped_strava_stubs})."
+        )
+        return {
+            "source": "intervals",
+            "fetched": 0,
+            "db_inserted": 0,
+            "total_csv_rows": len(existing_df),
+            "skipped_strava_stubs": skipped_strava_stubs,
+        }
+
+    # Process oldest-to-newest so rolling 90d FTP and chronological order are preserved
+    new_summaries.sort(key=lambda x: x.get("start_date") or x.get("start_date_local") or "")
+    print(f"Found {len(new_summaries)} new Intervals.icu activities to enrich.")
+
+    history_records: list[dict] = []
+    last_known_ftp: int | None = None
+    if not existing_df.empty and "Activity Date" in existing_df.columns:
+        hist_df = existing_df.copy()
+        hist_df["_ts"] = pd.to_datetime(hist_df["Activity Date"], errors="coerce")
+        hist_df = hist_df.sort_values("_ts", kind="mergesort", na_position="last")
+        for _, hrow in hist_df.iterrows():
+            hts = _to_naive_ts(hrow.get("_ts"))
+            h_ftp = _valid_num(hrow.get("effective_ftp"))
+            if h_ftp and h_ftp > 0:
+                last_known_ftp = int(round(h_ftp))
+            history_records.append({
+                "ts": hts,
+                "peak_20m_w": hrow.get("peak_20m_w"),
+                "peak_5m_w": hrow.get("peak_5m_w"),
+                "Max Heart Rate": hrow.get("Max Heart Rate"),
+                "effective_ftp": h_ftp,
+            })
+
+    new_rows = []
+    for idx, summary in enumerate(new_summaries, start=1):
+        raw_id = str(summary["id"])
+        int_id = intervals_id_to_int(raw_id)
+        act_name = summary.get("name") or "Unnamed Activity"
+        print(f"[{idx}/{len(new_summaries)}] Fetching & enriching Intervals.icu Activity {raw_id}: {act_name}...")
+
+        stream_df = pd.DataFrame()
+        lap_count = 0
+
+        # 1. Prefer Intervals.icu processed FIT file (.fit.gz), then original file, then JSON streams
+        for file_endpoint in (f"/activity/{raw_id}/fit-file", f"/activity/{raw_id}/file"):
+            try:
+                raw_bytes = client.get_bytes(file_endpoint)
+                if raw_bytes:
+                    stream_df, lap_count = parse_fit_bytes(raw_bytes, source_name=f"intervals_{raw_id}")
+                    if not stream_df.empty:
+                        break
+            except Exception as exc:
+                print(f"Warning: Could not download {file_endpoint}: {exc}")
+
+        if stream_df.empty:
+            try:
+                streams_payload = client.get_json(
+                    f"/activity/{raw_id}/streams.json",
+                    params={"types": "time,heartrate,watts,cadence,velocity_smooth,altitude"},
+                )
+                stream_df = intervals_streams_to_dataframe(streams_payload)
+            except Exception as exc:
+                print(f"Warning: Could not fetch streams for Intervals.icu activity {raw_id}: {exc}")
+
+        if lap_count == 0:
+            intervals_list = summary.get("icu_intervals") or []
+            lap_count = len(intervals_list) if intervals_list else 1
+
+        peaks = extract_stream_peaks(stream_df)
+        if _valid_num(peaks.get("clean_max_hr")) is None:
+            peaks["max_hr"] = _valid_num(summary.get("max_heartrate"))
+
+        start_iso = summary.get("start_date") or summary.get("start_date_local")
+        act_ts = _to_naive_ts(start_iso)
+        eff_ftp, eff_max_hr = resolve_dynamic_physiology(
+            activity_ts=act_ts,
+            history_records=history_records,
+            current_peaks=peaks,
+            last_known_ftp=last_known_ftp,
+        )
+        metrics = compute_stream_metrics(
+            stream_df,
+            lap_count=lap_count,
+            effective_ftp=eff_ftp,
+            effective_max_hr=eff_max_hr,
+            peaks=peaks,
+        )
+
+        last_known_ftp = eff_ftp
+        history_records.append({
+            "ts": act_ts,
+            "peak_20m_w": peaks.get("peak_20m_w"),
+            "peak_5m_w": peaks.get("peak_5m_w"),
+            "clean_max_hr": peaks.get("clean_max_hr"),
+            "Max Heart Rate": summary.get("max_heartrate"),
+            "effective_ftp": eff_ftp,
+        })
+        if act_ts is not None:
+            existing_timestamps.append(act_ts)
+
+        distance_m = _valid_num(summary.get("distance")) or 0.0
+        avg_watts = _valid_num(summary.get("icu_average_watts"))
+        if avg_watts is None:
+            avg_watts = _valid_num(summary.get("average_watts"))
+        if avg_watts is None:
+            avg_watts = metrics.get("avg_power_fit", np.nan)
+
+        weighted_watts = _valid_num(summary.get("icu_weighted_avg_watts"))
+        if weighted_watts is None:
+            weighted_watts = _valid_num(summary.get("weighted_average_watts"))
+        if weighted_watts is None:
+            weighted_watts = metrics.get("normalized_power", np.nan)
+
+        base_metadata = {
+            "Activity ID": int_id,
+            "Activity Date": format_strava_csv_date(start_iso),
+            "Activity Name": act_name,
+            "Activity Type": normalize_activity_type(summary.get("type") or ""),
+            "Activity Description": summary.get("description") or "",
+            "Elapsed Time": summary.get("elapsed_time") if summary.get("elapsed_time") is not None else summary.get("moving_time", np.nan),
+            "Moving Time": summary.get("moving_time", np.nan),
+            "Distance": round(distance_m / 1000.0, 2),
+            "Elevation Gain": summary.get("total_elevation_gain", np.nan),
+            "Average Heart Rate": summary.get("average_heartrate", np.nan),
+            "Max Heart Rate": summary.get("max_heartrate", np.nan),
+            "Average Watts": avg_watts,
+            "Weighted Average Power": weighted_watts,
+            "Relative Effort": summary.get("icu_training_load", np.nan),
+        }
+
+        row_data = {**base_metadata, **metrics}
+        new_rows.append(row_data)
+
+    new_df = pd.DataFrame(new_rows)
+    final_cols = BASE_COLS + METRIC_COLS
+
+    if not existing_df.empty:
+        for col in final_cols:
+            if col not in existing_df.columns:
+                existing_df[col] = np.nan
+        combined_df = pd.concat([existing_df[final_cols], new_df[final_cols]], ignore_index=True)
+    else:
+        combined_df = new_df[final_cols]
+
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    combined_df.to_csv(OUTPUT_CSV, index=False)
+    db_inserted = app_db.insert_activities(new_rows)
+    print(
+        f"Appended {len(new_df)} new Intervals.icu activities to {OUTPUT_CSV} "
+        f"(Total rows: {len(combined_df)}, DB inserted: {db_inserted})."
+    )
+    return {
+        "source": "intervals",
+        "fetched": len(new_df),
+        "db_inserted": db_inserted,
+        "total_csv_rows": len(combined_df),
+        "skipped_strava_stubs": skipped_strava_stubs,
+    }
+
+
+# =====================================================================
+# 5. CLI ENTRY POINT
 # =====================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Enrich Strava activities from bulk FIT export or Strava API.")
+    parser = argparse.ArgumentParser(
+        description="Enrich cycling activities from bulk FIT export, Intervals.icu API, or Strava API."
+    )
+    default_mode = (
+        "intervals"
+        if (OUTPUT_CSV.exists() and (INTERVALS_API_KEY or os.getenv("INTERVALS_API_KEY")))
+        else ("api" if OUTPUT_CSV.exists() else "bulk")
+    )
     parser.add_argument(
         "--mode",
-        choices=["bulk", "api"],
-        default="api" if OUTPUT_CSV.exists() else "bulk",
-        help="'bulk' parses strava_export/activities.csv + FIT files; 'api' fetches recent rides from Strava API."
+        choices=["bulk", "intervals", "strava", "api"],
+        default=default_mode,
+        help=(
+            "'bulk' parses strava_export/activities.csv + FIT files; "
+            "'intervals' fetches recent activities from Intervals.icu API; "
+            "'strava' / 'api' fetches recent rides from Strava API."
+        ),
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=30,
-        help="Max number of recent activities to check in API mode (default: 30)."
+        help="Max number of recent activities to check in API mode (default: 30).",
     )
     parser.add_argument(
         "--after-days",
         type=int,
         default=None,
-        help="Only check API activities from the last N days."
+        help="Only check activities from the last N days (Intervals.icu defaults to 90 days).",
     )
     args = parser.parse_args()
 
     if args.mode == "bulk":
         run_bulk_export()
+    elif args.mode == "intervals":
+        sync_recent_from_intervals(limit=args.limit, after_days=args.after_days)
     else:
         sync_recent_from_api(limit=args.limit, after_days=args.after_days)
 

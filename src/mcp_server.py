@@ -183,10 +183,32 @@ def get_recent_activities(days: int = 14) -> dict[str, Any]:
 
 
 @mcp.tool()
+def sync_activities_now(
+    limit: int = 30,
+    after_days: int | None = None,
+    source: str = "auto",
+) -> dict[str, Any]:
+    """
+    Trigger an immediate activity sync from the configured provider.
+    source: 'auto' (prefers Intervals.icu if INTERVALS_API_KEY is set, else Strava),
+    'intervals', or 'strava'.
+    """
+    clamped_limit = max(1, min(int(limit), 200))
+    return scheduler.run_sync(limit=clamped_limit, after_days=after_days, source=source)
+
+
+@mcp.tool()
+def sync_intervals_now(limit: int = 30, after_days: int | None = None) -> dict[str, Any]:
+    """Trigger an immediate Intervals.icu API sync for recent activities (default limit: 30, lookback: 90 days)."""
+    clamped_limit = max(1, min(int(limit), 200))
+    return scheduler.run_sync(limit=clamped_limit, after_days=after_days, source="intervals")
+
+
+@mcp.tool()
 def sync_strava_now(limit: int = 30) -> dict[str, Any]:
     """Trigger an immediate Strava API sync for recent activities (default limit: 30)."""
     clamped_limit = max(1, min(int(limit), 200))
-    return scheduler.run_sync(limit=clamped_limit)
+    return scheduler.run_sync(limit=clamped_limit, source="strava")
 
 
 @mcp.tool()

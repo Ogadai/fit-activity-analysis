@@ -33,16 +33,54 @@ def _get_analyse_module() -> ModuleType:
     return _ANALYSE_MODULE
 
 
-def run_sync(limit: int = 30, after_days: int | None = None) -> dict[str, Any]:
-    """Execute Strava API sync and return summary counts."""
+def _has_intervals_config() -> bool:
+    return bool(config.INTERVALS_API_KEY)
+
+
+def _has_strava_config() -> bool:
+    has_token_file = config.TOKEN_FILE.exists()
+    has_creds = bool(
+        config.STRAVA_CLIENT_ID
+        and config.STRAVA_CLIENT_SECRET
+        and config.STRAVA_REFRESH_TOKEN
+    )
+    return has_token_file or has_creds
+
+
+def resolve_sync_source(explicit_source: str | None = None) -> str:
+    """Resolve active sync source ('intervals', 'strava', or 'none')."""
+    candidate = (explicit_source or config.SYNC_SOURCE or "auto").strip().lower()
+    if candidate in {"intervals", "strava", "none"}:
+        return candidate
+    if _has_intervals_config():
+        return "intervals"
+    if _has_strava_config():
+        return "strava"
+    return "intervals"
+
+
+def run_sync(
+    limit: int = 30,
+    after_days: int | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Execute activity sync (Intervals.icu or Strava API) and return summary counts."""
+    resolved = resolve_sync_source(source)
+    if resolved == "none":
+        logger.info("Scheduled sync skipped (SYNC_SOURCE=none).")
+        return {"source": "none", "fetched": 0, "db_inserted": 0}
+
     try:
         module = _get_analyse_module()
-        result = module.sync_recent_from_api(limit=limit, after_days=after_days)
-        logger.info("Strava sync completed: %s", result)
-        return result or {"fetched": 0, "db_inserted": 0}
+        if resolved == "intervals":
+            result = module.sync_recent_from_intervals(limit=limit, after_days=after_days)
+        else:
+            result = module.sync_recent_from_api(limit=limit, after_days=after_days)
+        logger.info("%s sync completed: %s", resolved.capitalize(), result)
+        return result or {"source": resolved, "fetched": 0, "db_inserted": 0}
     except Exception as exc:
-        logger.exception("Strava sync failed: %s", exc)
-        return {"error": str(exc), "fetched": 0, "db_inserted": 0}
+        logger.exception("%s sync failed: %s", resolved.capitalize(), exc)
+        return {"source": resolved, "error": str(exc), "fetched": 0, "db_inserted": 0}
 
 
 def start_scheduler(run_on_startup: bool = True) -> BackgroundScheduler:

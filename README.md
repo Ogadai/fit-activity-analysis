@@ -67,7 +67,23 @@ If you haven't generated `server/enriched_activities.csv` yet:
 python analyse-activities.py --mode bulk
 ```
 
-### 4. Ingest from the Strava API
+### 4. Ingest from Intervals.icu (Recommended — Free Official API)
+1. In Intervals.icu, go to **Settings → Developer Settings** and generate an **API Key**.
+   *(Make sure your Garmin, Zwift, Wahoo, or other sources are connected directly to Intervals.icu rather than only via Strava, as Strava-sourced activities cannot be exported through the Intervals.icu API.)*
+2. Set `INTERVALS_API_KEY` in `.env` (or PowerShell):
+   ```powershell
+   $env:INTERVALS_API_KEY = "YOUR_INTERVALS_API_KEY"
+   ```
+   *(Optional: `INTERVALS_ATHLETE_ID` defaults to `0`, which automatically resolves to the API key owner.)*
+3. Fetch and enrich recent activities:
+   ```powershell
+   python analyse-activities.py --mode intervals --limit 30
+   ```
+   Intervals.icu mode downloads each activity's `.fit.gz` file (falling back to 1Hz JSON streams if needed), deduplicates against both Activity ID and start timestamp (±90s, so historical Strava rides are never duplicated), appends new rows to `server/enriched_activities.csv`, and inserts them into `server/cycling.db`.
+
+   When `SYNC_SOURCE=auto` (the default), the background scheduler automatically uses **Intervals.icu** whenever `INTERVALS_API_KEY` is set, falling back to Strava otherwise. Set `SYNC_SOURCE=intervals`, `strava`, or `none` in `.env` to pin a specific provider.
+
+### 4b. Ingest from the Strava API (Alternative)
 Provide Strava OAuth2 credentials either in `server/.strava_tokens.json`:
 ```json
 {
@@ -117,8 +133,8 @@ http://localhost:8050/sse
 ```
 
 Available MCP tools and resources:
-- **Tools:** `get_training_playbook`, `get_current_readiness`, `get_recent_activities`, `sync_strava_now`, `query_training_database`
-- **Resources:** `coach://playbook`, `coach://status-summary`
+- **Tools:** `get_training_playbook`, `get_current_readiness`, `get_recent_activities`, `sync_activities_now`, `sync_intervals_now`, `sync_strava_now`, `query_training_database`, `save_training_plan`, `get_training_plan`, `update_training_plan`, `save_athlete_note`, `get_athlete_notes`, `update_athlete_note`
+- **Resources:** `coach://playbook`, `coach://status-summary`, `coach://training-plan`, `coach://athlete-notes`
 
 ---
 
