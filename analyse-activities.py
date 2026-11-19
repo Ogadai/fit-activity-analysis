@@ -887,7 +887,7 @@ def sync_recent_from_intervals(limit: int = 30, after_days: int | None = None) -
         if "Activity ID" in existing_df.columns:
             existing_ids = set(pd.to_numeric(existing_df["Activity ID"], errors="coerce").dropna().astype(int))
         if "Activity Date" in existing_df.columns:
-            parsed_dates = pd.to_datetime(existing_df["Activity Date"], errors="coerce").dropna()
+            parsed_dates = pd.to_datetime(existing_df["Activity Date"], format="mixed", errors="coerce").dropna()
             existing_timestamps = [ts.tz_localize(None) if ts.tzinfo is not None else ts for ts in parsed_dates]
         print(f"Loaded existing dataset ({len(existing_df)} rows). Checking Intervals.icu for new activities...")
     else:
@@ -907,11 +907,16 @@ def sync_recent_from_intervals(limit: int = 30, after_days: int | None = None) -
     for act in raw_activities:
         if not isinstance(act, dict) or not act.get("id"):
             continue
+        source = str(act.get("source", "")).upper()
+        note = str(act.get("_note", "")).upper()
+        has_metrics = bool(act.get("type") or act.get("moving_time") or act.get("elapsed_time") or act.get("distance"))
+        # Intervals.icu returns blank stub objects (often still containing start_date_local and _note)
+        # for Strava-sourced activities because Strava forbids API re-export.
+        if "STRAVA" in note or (source == "STRAVA" and not has_metrics):
+            skipped_strava_stubs += 1
+            continue
         start_iso = act.get("start_date") or act.get("start_date_local")
-        # Intervals.icu returns minimal stub objects (no start_date/name) for Strava-sourced activities
-        if not start_iso:
-            if str(act.get("source", "")).upper() == "STRAVA":
-                skipped_strava_stubs += 1
+        if not start_iso or not has_metrics:
             continue
         candidates.append(act)
 
@@ -935,13 +940,20 @@ def sync_recent_from_intervals(limit: int = 30, after_days: int | None = None) -
             f"All recent Intervals.icu activities are already present in the dataset "
             f"(skipped_strava_stubs={skipped_strava_stubs})."
         )
-        return {
+        result = {
             "source": "intervals",
             "fetched": 0,
             "db_inserted": 0,
             "total_csv_rows": len(existing_df),
             "skipped_strava_stubs": skipped_strava_stubs,
         }
+        if skipped_strava_stubs > 0:
+            result["note"] = (
+                f"Skipped {skipped_strava_stubs} Strava-sourced activity stub(s) that Intervals.icu "
+                "cannot export via API due to Strava restrictions. Connect Garmin, Zwift, Wahoo, etc. "
+                "directly to Intervals.icu so full activity data is available."
+            )
+        return result
 
     # Process oldest-to-newest so rolling 90d FTP and chronological order are preserved
     new_summaries.sort(key=lambda x: x.get("start_date") or x.get("start_date_local") or "")
