@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -136,6 +137,19 @@ def init_db(db_path: Path | None = None) -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_athlete_notes_active
         ON athlete_notes (is_active, effective_until);
+
+    CREATE TABLE IF NOT EXISTS activity_timelines (
+        activity_id INTEGER PRIMARY KEY,
+        source TEXT,
+        duration_sec INTEGER,
+        segment_count INTEGER NOT NULL DEFAULT 0,
+        summary_text TEXT NOT NULL,
+        segments_json TEXT NOT NULL,
+        highlights_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (activity_id) REFERENCES activities ("Activity ID") ON DELETE CASCADE
+    );
     """
     with contextlib.closing(get_connection(db_path)) as conn:
         conn.executescript(ddl)
@@ -904,3 +918,139 @@ def update_athlete_note(
 
         row = conn.execute("SELECT * FROM athlete_notes WHERE id = ?", (int(note_id),)).fetchone()
     return _row_to_note_dict(row) if row is not None else None
+
+
+def _row_to_timeline_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert an activity_timelines SQLite row into a JSON-serializable dict."""
+    data = dict(row)
+    raw_segments = data.pop("segments_json", "[]")
+    raw_highlights = data.pop("highlights_json", None)
+    try:
+        data["segments"] = json.loads(raw_segments) if raw_segments else []
+    except (TypeError, ValueError):
+        data["segments"] = []
+    try:
+        data["highlights"] = json.loads(raw_highlights) if raw_highlights else {}
+    except (TypeError, ValueError):
+        data["highlights"] = {}
+    return data
+
+
+def upsert_activity_timelines(
+    timelines: list[dict[str, Any]],
+    db_path: Path | None = None,
+) -> int:
+    """
+    Insert or update compiled activity timeline summaries in activity_timelines.
+    Each item should contain: activity_id, summary_text, segments (list),
+    and optional source, duration_sec, highlights (dict).
+    """
+    if not timelines:
+        return 0
+
+    init_db(db_path)
+    now = _utc_now_iso()
+    sql = """
+        INSERT INTO activity_timelines (
+            activity_id, source, duration_sec, segment_count,
+            summary_text, segments_json, highlights_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(activity_id) DO UPDATE SET
+            source = excluded.source,
+            duration_sec = excluded.duration_sec,
+            segment_count = excluded.segment_count,
+            summary_text = excluded.summary_text,
+            segments_json = excluded.segments_json,
+            highlights_json = excluded.highlights_json,
+            updated_at = excluded.updated_at
+    """
+
+    rows_to_write: list[tuple[Any, ...]] = []
+    for item in timelines:
+        act_id = _clean_value(item.get("activity_id"), "Activity ID")
+        summary_text = (item.get("summary_text") or "").strip()
+        if act_id is None or not summary_text:
+            continue
+        segments = item.get("segments") or []
+        highlights = item.get("highlights") or {}
+        duration_sec = item.get("duration_sec")
+        if duration_sec is not None:
+            try:
+                duration_sec = int(round(float(duration_sec)))
+            except (TypeError, ValueError):
+                duration_sec = None
+        rows_to_write.append(
+            (
+                int(act_id),
+                (item.get("source") or "intervals").strip() or "intervals",
+                duration_sec,
+                len(segments),
+                summary_text,
+                json.dumps(segments, ensure_ascii=False),
+                json.dumps(highlights, ensure_ascii=False),
+                now,
+                now,
+            )
+        )
+
+    if not rows_to_write:
+        return 0
+
+    with contextlib.closing(get_connection(db_path)) as conn:
+        conn.executemany(sql, rows_to_write)
+        conn.commit()
+    return len(rows_to_write)
+
+
+def upsert_activity_timeline(
+    activity_id: int,
+    timeline: dict[str, Any],
+    source: str = "intervals",
+    db_path: Path | None = None,
+) -> bool:
+    """Insert or update a single compiled activity timeline."""
+    payload = dict(timeline)
+    payload["activity_id"] = activity_id
+    payload.setdefault("source", source)
+    return upsert_activity_timelines([payload], db_path=db_path) > 0
+
+
+def get_activity_timeline(
+    activity_id: int,
+    db_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Retrieve the compiled timeline (summary, segments, highlights) for an activity."""
+    init_db(db_path)
+    with contextlib.closing(get_connection(db_path)) as conn:
+        row = conn.execute(
+            "SELECT * FROM activity_timelines WHERE activity_id = ?",
+            (int(activity_id),),
+        ).fetchone()
+    return _row_to_timeline_dict(row) if row is not None else None
+
+
+def get_activity_timelines_map(
+    activity_ids: list[int],
+    db_path: Path | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Retrieve a mapping of activity_id -> parsed timeline dict for the given IDs."""
+    if not activity_ids:
+        return {}
+    init_db(db_path)
+    clean_ids = [int(aid) for aid in activity_ids]
+    placeholders = ", ".join("?" for _ in clean_ids)
+    with contextlib.closing(get_connection(db_path)) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM activity_timelines WHERE activity_id IN ({placeholders})",
+            clean_ids,
+        ).fetchall()
+    return {int(row["activity_id"]): _row_to_timeline_dict(row) for row in rows}
+
+
+def get_existing_timeline_ids(db_path: Path | None = None) -> set[int]:
+    """Return the set of activity_ids that already have a compiled timeline stored."""
+    init_db(db_path)
+    with contextlib.closing(get_connection(db_path)) as conn:
+        rows = conn.execute("SELECT activity_id FROM activity_timelines").fetchall()
+    return {int(row[0]) for row in rows}

@@ -63,6 +63,7 @@ def run_sync(
     limit: int = 30,
     after_days: int | None = None,
     source: str | None = None,
+    backfill_timelines: bool = False,
 ) -> dict[str, Any]:
     """Execute activity sync (Intervals.icu or Strava API) and return summary counts."""
     resolved = resolve_sync_source(source)
@@ -73,7 +74,11 @@ def run_sync(
     try:
         module = _get_analyse_module()
         if resolved == "intervals":
-            result = module.sync_recent_from_intervals(limit=limit, after_days=after_days)
+            result = module.sync_recent_from_intervals(
+                limit=limit,
+                after_days=after_days,
+                backfill_timelines=backfill_timelines,
+            )
         else:
             result = module.sync_recent_from_api(limit=limit, after_days=after_days)
         logger.info("%s sync completed: %s", resolved.capitalize(), result)

@@ -6,7 +6,7 @@ import logging
 import re
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import date, timedelta
 from typing import Any
 
@@ -31,6 +31,10 @@ mcp = FastMCP(
         "events, or preferences for future sessions (e.g. 'I can only work out on Mondays and "
         "Tuesdays at the moment'), call save_athlete_note() (or update_athlete_note() if "
         "updating/replacing an existing note) so it is persisted in the database for future chats. "
+        "Whenever the user asks about how a specific race or ride progressed, check the "
+        "`timeline_summary` returned by get_recent_activities() or call "
+        "get_activity_timeline(activity_id) for the full segment-by-segment breakdown of climbs, "
+        "efforts, power, and heart rate. "
         "Whenever you create or revise a training plan, call save_training_plan() (or "
         "update_training_plan()) to store it in the database."
     ),
@@ -158,13 +162,18 @@ def status_summary_resource() -> str:
 
 
 @mcp.tool()
-def get_recent_activities(days: int = 14) -> dict[str, Any]:
-    """Return enriched activities from the last N days (default: 14, max: 365)."""
+def get_recent_activities(days: int = 14, include_timeline: bool = True) -> dict[str, Any]:
+    """
+    Return enriched activities from the last N days (default: 14, max: 365).
+    When include_timeline=True (default), attaches `timeline_summary` and
+    `timeline_highlights` (climbs, hard efforts, power/HR progression) for any
+    activity with a compiled timeline in activity_timelines.
+    """
     clamped_days = max(1, min(int(days), 365))
     cutoff = (date.today() - timedelta(days=clamped_days)).isoformat()
 
     db.init_db()
-    with db.get_connection() as conn:
+    with closing(db.get_connection()) as conn:
         rows = conn.execute(
             """
             SELECT *
@@ -175,11 +184,72 @@ def get_recent_activities(days: int = 14) -> dict[str, Any]:
             (cutoff,),
         ).fetchall()
 
+    activities = [dict(r) for r in rows]
+    if include_timeline and activities:
+        act_ids = [int(a["Activity ID"]) for a in activities if a.get("Activity ID") is not None]
+        timelines_map = db.get_activity_timelines_map(act_ids)
+        for act in activities:
+            aid = act.get("Activity ID")
+            tl = timelines_map.get(int(aid)) if aid is not None else None
+            act["timeline_summary"] = tl["summary_text"] if tl else None
+            act["timeline_highlights"] = tl["highlights"] if tl else None
+
     return {
         "days": clamped_days,
         "cutoff_date": cutoff,
-        "count": len(rows),
-        "activities": [dict(r) for r in rows],
+        "count": len(activities),
+        "activities": activities,
+    }
+
+
+@mcp.tool()
+def get_activity_timeline(activity_id: int) -> dict[str, Any]:
+    """
+    Return the full compiled chronological timeline (summary_text, structured segments
+    with climbs/efforts/power/HR/grade, and key highlights) for a single activity_id.
+    """
+    db.init_db()
+    timeline = db.get_activity_timeline(int(activity_id))
+    with closing(db.get_connection()) as conn:
+        act_row = conn.execute(
+            """
+            SELECT
+                "Activity ID",
+                "Activity Date",
+                "Activity Name",
+                "Activity Type",
+                "Moving Time",
+                "Distance",
+                "Elevation Gain",
+                "Average Watts",
+                normalized_power,
+                "Average Heart Rate",
+                "Max Heart Rate",
+                effective_ftp,
+                effective_max_hr
+            FROM activities
+            WHERE "Activity ID" = ?
+            """,
+            (int(activity_id),),
+        ).fetchone()
+
+    if timeline is None:
+        return {
+            "found": False,
+            "activity_id": int(activity_id),
+            "activity": dict(act_row) if act_row is not None else None,
+            "error": (
+                f"No compiled timeline found for activity {activity_id}. "
+                "Timelines are compiled during Intervals.icu/Strava syncs; run "
+                "sync_intervals_now(backfill_timelines=True) to backfill recent activities."
+            ),
+        }
+
+    return {
+        "found": True,
+        "activity_id": int(activity_id),
+        "activity": dict(act_row) if act_row is not None else None,
+        "timeline": timeline,
     }
 
 
@@ -188,21 +258,41 @@ def sync_activities_now(
     limit: int = 30,
     after_days: int | None = None,
     source: str = "auto",
+    backfill_timelines: bool = False,
 ) -> dict[str, Any]:
     """
     Trigger an immediate activity sync from the configured provider.
     source: 'auto' (prefers Intervals.icu if INTERVALS_API_KEY is set, else Strava),
     'intervals', or 'strava'.
+    Set backfill_timelines=True (with Intervals.icu) to also compile timelines for
+    already-synced activities in the lookback window that do not yet have one.
     """
     clamped_limit = max(1, min(int(limit), 200))
-    return scheduler.run_sync(limit=clamped_limit, after_days=after_days, source=source)
+    return scheduler.run_sync(
+        limit=clamped_limit,
+        after_days=after_days,
+        source=source,
+        backfill_timelines=backfill_timelines,
+    )
 
 
 @mcp.tool()
-def sync_intervals_now(limit: int = 30, after_days: int | None = None) -> dict[str, Any]:
-    """Trigger an immediate Intervals.icu API sync for recent activities (default limit: 30, lookback: 90 days)."""
+def sync_intervals_now(
+    limit: int = 30,
+    after_days: int | None = None,
+    backfill_timelines: bool = False,
+) -> dict[str, Any]:
+    """
+    Trigger an immediate Intervals.icu API sync for recent activities (default limit: 30, lookback: 90 days).
+    Set backfill_timelines=True to also compile timelines for already-synced activities missing one.
+    """
     clamped_limit = max(1, min(int(limit), 200))
-    return scheduler.run_sync(limit=clamped_limit, after_days=after_days, source="intervals")
+    return scheduler.run_sync(
+        limit=clamped_limit,
+        after_days=after_days,
+        source="intervals",
+        backfill_timelines=backfill_timelines,
+    )
 
 
 @mcp.tool()
