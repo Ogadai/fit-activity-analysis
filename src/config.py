@@ -9,6 +9,10 @@ DEFAULT_MAX_HR: int = int(os.getenv("MAX_HR", "185"))
 FTP: int = DEFAULT_FTP
 MAX_HR: int = DEFAULT_MAX_HR
 
+# Automated eFTP (Morton 3-parameter Critical Power model, Intervals.icu-style)
+EFTP_MIN_DURATION_SEC: int = int(os.getenv("EFTP_MIN_DURATION_SEC", "180"))
+EFTP_WINDOW_DAYS: int = int(os.getenv("EFTP_WINDOW_DAYS", "90"))
+
 # Storage & data paths
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./server"))
 STRAVA_DIR: Path = Path(os.getenv("STRAVA_DIR", str(DATA_DIR / "strava_export")))

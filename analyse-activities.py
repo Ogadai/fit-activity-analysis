@@ -20,6 +20,8 @@ from src import db as app_db
 # --- COLD-START PHYSIOLOGY & PATH SETTINGS ---
 DEFAULT_FTP = app_config.DEFAULT_FTP        # Cold-start Functional Threshold Power in Watts
 DEFAULT_MAX_HR = app_config.DEFAULT_MAX_HR  # Cold-start Maximum Heart Rate in bpm
+EFTP_MIN_DURATION_SEC = app_config.EFTP_MIN_DURATION_SEC  # Min effort duration for eFTP (default 180s)
+EFTP_WINDOW_DAYS = app_config.EFTP_WINDOW_DAYS            # Trailing window for eFTP MMP envelope (default 90d)
 STRAVA_DIR = app_config.STRAVA_DIR
 OUTPUT_CSV = app_config.CSV_PATH
 TOKEN_FILE = app_config.TOKEN_FILE
@@ -51,28 +53,67 @@ METRIC_COLS = [
 ]
 
 
+# Standard Mean Maximal Power (MMP) anchor durations (seconds) for Morton 3P eFTP modeling
+MMP_DURATIONS_SEC: tuple[int, ...] = (
+    5, 15, 30, 60, 120, 180, 300, 480, 720, 1200, 1800, 2700, 3600
+)
+
+# Morton's 3-parameter Critical Power model (Morton, 1996):
+#   P(t) = CP + W' / (t + tau),  where tau = W' / (P_max - CP)
+# Reparameterized by alpha = W' / CP (seconds) and tau (seconds):
+#   P(t) = CP * (1 + alpha / (t + tau))
+# Population physiological prior (aligned with Intervals.icu / FastFitness.Tips curves):
+#   alpha_0 = 68s (e.g. W' = 17 kJ at 250W CP), P_max / CP = 4.0 => tau_0 = 68 / 3 = 22.67s
+_MORTON_ALPHA_PRIOR: float = 68.0
+_MORTON_TAU_PRIOR: float = 68.0 / 3.0
+_MORTON_ALPHAS = np.linspace(35.0, 110.0, 76)
+_MORTON_TAUS = np.geomspace(6.0, 55.0, 30)
+_MORTON_ALPHA_GRID, _MORTON_TAU_GRID = np.meshgrid(
+    _MORTON_ALPHAS, _MORTON_TAUS, indexing="ij"
+)
+_MORTON_REG_GRID = (
+    0.0015 * ((_MORTON_ALPHA_GRID - _MORTON_ALPHA_PRIOR) / 20.0) ** 2
+    + 0.0008 * ((_MORTON_TAU_GRID - _MORTON_TAU_PRIOR) / 15.0) ** 2
+)
+
+
 # =====================================================================
 # 1. CORE METRIC ENGINE (Shared by FIT Parser and Strava API Streams)
 # =====================================================================
 def extract_stream_peaks(df: pd.DataFrame) -> dict:
     """
-    Extracts raw power peaks (1m, 5m, 20m) and a spike-filtered 5-second rolling
-    mean clean_max_hr (bounded between 135 and 208 bpm) from a 1Hz stream DataFrame.
+    Extracts raw power peaks (1m, 5m, 20m), a multi-duration Mean Maximal Power
+    (MMP) curve for Morton 3-parameter eFTP modeling, and a spike-filtered 5-second
+    rolling mean clean_max_hr (bounded between 135 and 208 bpm) from a 1Hz stream.
     """
-    peaks = {
+    peaks: dict = {
         "peak_1m_w": np.nan,
         "peak_5m_w": np.nan,
         "peak_20m_w": np.nan,
         "clean_max_hr": np.nan,
+        "mmp_curve": {},
     }
     if df.empty:
         return peaks
 
     pwr = pd.to_numeric(df["power"], errors="coerce").dropna()
-    if len(pwr) > 0:
-        for label, secs in [("peak_1m_w", 60), ("peak_5m_w", 300), ("peak_20m_w", 1200)]:
-            if len(pwr) >= secs:
-                peaks[label] = round(float(pwr.rolling(window=secs).mean().max()), 1)
+    n_pwr = len(pwr)
+    if n_pwr > 0:
+        pwr_arr = pwr.to_numpy(dtype=float)
+        cs = np.concatenate(([0.0], np.cumsum(pwr_arr)))
+        mmp_curve: dict[int, float] = {}
+        for secs in MMP_DURATIONS_SEC:
+            if n_pwr >= secs:
+                peak_w = float(np.max((cs[secs:] - cs[:-secs]) / secs))
+                if peak_w > 0:
+                    mmp_curve[secs] = round(peak_w, 1)
+        peaks["mmp_curve"] = mmp_curve
+        if 60 in mmp_curve:
+            peaks["peak_1m_w"] = mmp_curve[60]
+        if 300 in mmp_curve:
+            peaks["peak_5m_w"] = mmp_curve[300]
+        if 1200 in mmp_curve:
+            peaks["peak_20m_w"] = mmp_curve[1200]
 
     hr = pd.to_numeric(df["hr"], errors="coerce").dropna()
     if len(hr) >= 5:
@@ -98,31 +139,141 @@ def _valid_num(val) -> float | None:
         return None
 
 
+def _merge_mmp_from_record(mmp_envelope: dict[int, float], rec: dict) -> None:
+    """Merge an activity record's MMP curve and/or summary peak power fields into mmp_envelope."""
+    raw_curve = rec.get("mmp_curve")
+    if isinstance(raw_curve, dict):
+        for dur_key, watts_val in raw_curve.items():
+            dur = _valid_num(dur_key)
+            watts = _valid_num(watts_val)
+            if dur and dur > 0 and watts and watts > 0:
+                d_int = int(round(dur))
+                if watts > mmp_envelope.get(d_int, 0.0):
+                    mmp_envelope[d_int] = watts
+
+    for key, secs in (("peak_1m_w", 60), ("peak_5m_w", 300), ("peak_20m_w", 1200)):
+        watts = _valid_num(rec.get(key))
+        if watts and watts > 0 and watts > mmp_envelope.get(secs, 0.0):
+            mmp_envelope[secs] = watts
+
+
+def estimate_eftp_morton3p(
+    mmp_watts: dict[int, float],
+    min_duration_sec: int = EFTP_MIN_DURATION_SEC,
+) -> dict | None:
+    """
+    Estimate automated eFTP using Morton's 3-parameter Critical Power model
+    (the approach used by Intervals.icu):
+
+        P(t) = CP + W' / (t + tau),   tau = W' / (P_max - CP)
+
+    Fits the tightest physiological upper-envelope Morton 3P curve over the
+    athlete's Mean Maximal Power (MMP) envelope:
+      - Requires at least one effort >= min_duration_sec (default 180s / 3m).
+      - Uses capped relative excess loss + gentle physiological prior regularization
+        so submaximal long rides (e.g. Z2 endurance) do not drag CP down, while
+        genuinely maximal multi-duration efforts solve for the athlete's true
+        (CP, W', P_max).
+      - Gracefully degrades to Intervals.icu-style single-effort Morton 3P curve
+        projection when only a single maximal effort exists.
+
+    Returns a dict with eftp, cp, w_prime, p_max, tau, source_duration_sec,
+    source_watts, or None if no aerobic-domain efforts (>= min_duration_sec) exist.
+    """
+    if not mmp_watts:
+        return None
+
+    pts = sorted(
+        (int(t), float(p))
+        for t, p in mmp_watts.items()
+        if t is not None and p is not None and int(t) > 0 and float(p) > 0
+    )
+    if not pts:
+        return None
+
+    ts = np.array([t for t, _ in pts], dtype=float)
+    ps = np.array([p for _, p in pts], dtype=float)
+
+    # Enforce monotonic non-increasing MMP envelope (shorter durations >= longer durations)
+    for i in range(len(ps) - 2, -1, -1):
+        if ps[i] < ps[i + 1]:
+            ps[i] = ps[i + 1]
+
+    min_dur = max(60, int(min_duration_sec))
+    aerobic_mask = ts >= min_dur
+    if not np.any(aerobic_mask):
+        return None
+
+    ts_a = ts[aerobic_mask]
+    ps_a = ps[aerobic_mask]
+
+    # Upper-envelope CP for every (alpha, tau) pair on the physiological grid
+    scale_a = 1.0 + _MORTON_ALPHA_GRID[:, :, None] / (
+        ts_a[None, None, :] + _MORTON_TAU_GRID[:, :, None]
+    )
+    cp_grid = np.max(ps_a[None, None, :] / scale_a, axis=2)
+
+    scale_all = 1.0 + _MORTON_ALPHA_GRID[:, :, None] / (
+        ts[None, None, :] + _MORTON_TAU_GRID[:, :, None]
+    )
+    pred_all = cp_grid[:, :, None] * scale_all
+    rel_err = (pred_all - ps[None, None, :]) / ps[None, None, :]
+
+    # Capped loss ignores clearly submaximal durations (>8% below curve);
+    # shorter anaerobic efforts (< min_dur) have reduced weight to anchor tau/P_max
+    # without letting an isolated sprint distort aerobic CP.
+    delta = 0.08
+    weights = np.where(aerobic_mask, 1.0, 0.35)[None, None, :]
+    err_sq = np.minimum(rel_err ** 2, delta ** 2)
+    loss_grid = np.sum(weights * err_sq, axis=2) + _MORTON_REG_GRID
+
+    best_flat = int(np.argmin(loss_grid))
+    ia, it = divmod(best_flat, _MORTON_TAUS.size)
+    cp = float(cp_grid[ia, it])
+    alpha = float(_MORTON_ALPHAS[ia])
+    tau = float(_MORTON_TAUS[it])
+    w_prime = cp * alpha
+    p_max = cp * (1.0 + alpha / tau)
+
+    implied_a = ps_a / (1.0 + alpha / (ts_a + tau))
+    best_a_idx = int(np.argmax(implied_a))
+
+    return {
+        "eftp": int(round(cp)),
+        "cp": round(cp, 1),
+        "w_prime": round(w_prime, 0),
+        "p_max": round(p_max, 0),
+        "tau": round(tau, 1),
+        "source_duration_sec": int(ts_a[best_a_idx]),
+        "source_watts": round(float(ps_a[best_a_idx]), 1),
+    }
+
+
 def resolve_dynamic_physiology(
     activity_ts: pd.Timestamp | None,
     history_records: list[dict],
     current_peaks: dict | None = None,
     last_known_ftp: int | None = None,
+    min_duration_sec: int = EFTP_MIN_DURATION_SEC,
+    window_days: int = EFTP_WINDOW_DAYS,
 ) -> tuple[int, int]:
     """
     Resolves (effective_ftp, effective_max_hr) using trailing rolling windows:
-      - effective_ftp: round(max(0.95 * peak_20m_w, 0.80 * peak_5m_w)) over trailing 90 days
-        up to activity_ts (inclusive of current_peaks), carrying forward last_known_ftp
-        if no power peaks exist in the 90-day window, then falling back to DEFAULT_FTP.
+      - effective_ftp: automated eFTP via Morton's 3-parameter Critical Power model
+        fitted to the trailing `window_days` (default 90d) Mean Maximal Power (MMP)
+        envelope up to activity_ts (inclusive of current_peaks, minimum effort
+        duration `min_duration_sec`, default 180s), carrying forward last_known_ftp
+        if no aerobic power peaks exist in the window, then falling back to DEFAULT_FTP.
       - effective_max_hr: max of valid HR (135 <= hr <= 208) over trailing 365 days
         up to activity_ts (inclusive of current_peaks), falling back to DEFAULT_MAX_HR.
     """
     current_peaks = current_peaks or {}
 
     if activity_ts is None or pd.isna(activity_ts):
-        ftp_candidates = []
-        p20 = _valid_num(current_peaks.get("peak_20m_w"))
-        p5 = _valid_num(current_peaks.get("peak_5m_w"))
-        if p20 and p20 > 0:
-            ftp_candidates.append(0.95 * p20)
-        if p5 and p5 > 0:
-            ftp_candidates.append(0.80 * p5)
-        eff_ftp = int(round(max(ftp_candidates))) if ftp_candidates else (last_known_ftp or DEFAULT_FTP)
+        mmp_envelope: dict[int, float] = {}
+        _merge_mmp_from_record(mmp_envelope, current_peaks)
+        eftp_res = estimate_eftp_morton3p(mmp_envelope, min_duration_sec=min_duration_sec)
+        eff_ftp = eftp_res["eftp"] if eftp_res else (last_known_ftp or DEFAULT_FTP)
 
         hr_candidates = [
             h for h in (_valid_num(current_peaks.get("clean_max_hr")), _valid_num(current_peaks.get("max_hr")))
@@ -131,10 +282,10 @@ def resolve_dynamic_physiology(
         eff_max_hr = int(round(max(hr_candidates))) if hr_candidates else DEFAULT_MAX_HR
         return eff_ftp, eff_max_hr
 
-    ftp_cutoff = activity_ts - pd.Timedelta(days=90)
+    ftp_cutoff = activity_ts - pd.Timedelta(days=window_days)
     hr_cutoff = activity_ts - pd.Timedelta(days=365)
 
-    ftp_candidates: list[float] = []
+    mmp_envelope = {}
     hr_candidates: list[float] = []
     latest_hist_ftp: int | None = last_known_ftp
 
@@ -148,12 +299,7 @@ def resolve_dynamic_physiology(
             latest_hist_ftp = int(round(rec_ftp))
 
         if rec_ts >= ftp_cutoff:
-            p20 = _valid_num(rec.get("peak_20m_w"))
-            p5 = _valid_num(rec.get("peak_5m_w"))
-            if p20 and p20 > 0:
-                ftp_candidates.append(0.95 * p20)
-            if p5 and p5 > 0:
-                ftp_candidates.append(0.80 * p5)
+            _merge_mmp_from_record(mmp_envelope, rec)
 
         if rec_ts >= hr_cutoff:
             for key in ("clean_max_hr", "max_hr", "Max Heart Rate"):
@@ -161,20 +307,16 @@ def resolve_dynamic_physiology(
                 if h is not None and 135 <= h <= 208:
                     hr_candidates.append(h)
 
-    p20_cur = _valid_num(current_peaks.get("peak_20m_w"))
-    p5_cur = _valid_num(current_peaks.get("peak_5m_w"))
-    if p20_cur and p20_cur > 0:
-        ftp_candidates.append(0.95 * p20_cur)
-    if p5_cur and p5_cur > 0:
-        ftp_candidates.append(0.80 * p5_cur)
+    _merge_mmp_from_record(mmp_envelope, current_peaks)
 
     for key in ("clean_max_hr", "max_hr", "Max Heart Rate"):
         h_cur = _valid_num(current_peaks.get(key))
         if h_cur is not None and 135 <= h_cur <= 208:
             hr_candidates.append(h_cur)
 
-    if ftp_candidates:
-        eff_ftp = int(round(max(ftp_candidates)))
+    eftp_res = estimate_eftp_morton3p(mmp_envelope, min_duration_sec=min_duration_sec)
+    if eftp_res is not None and eftp_res["eftp"] > 0:
+        eff_ftp = eftp_res["eftp"]
     elif latest_hist_ftp and latest_hist_ftp > 0:
         eff_ftp = int(latest_hist_ftp)
     else:
@@ -880,6 +1022,8 @@ def run_bulk_export():
         last_known_ftp = eff_ftp
         history_records.append({
             "ts": row_ts,
+            "mmp_curve": peaks.get("mmp_curve"),
+            "peak_1m_w": peaks.get("peak_1m_w"),
             "peak_20m_w": peaks.get("peak_20m_w"),
             "peak_5m_w": peaks.get("peak_5m_w"),
             "clean_max_hr": peaks.get("clean_max_hr"),
@@ -1095,6 +1239,7 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
                 last_known_ftp = int(round(h_ftp))
             history_records.append({
                 "ts": hts,
+                "peak_1m_w": hrow.get("peak_1m_w"),
                 "peak_20m_w": hrow.get("peak_20m_w"),
                 "peak_5m_w": hrow.get("peak_5m_w"),
                 "Max Heart Rate": hrow.get("Max Heart Rate"),
@@ -1153,6 +1298,8 @@ def sync_recent_from_api(limit: int = 30, after_days: int = None):
         last_known_ftp = eff_ftp
         history_records.append({
             "ts": act_ts,
+            "mmp_curve": peaks.get("mmp_curve"),
+            "peak_1m_w": peaks.get("peak_1m_w"),
             "peak_20m_w": peaks.get("peak_20m_w"),
             "peak_5m_w": peaks.get("peak_5m_w"),
             "clean_max_hr": peaks.get("clean_max_hr"),
@@ -1523,6 +1670,7 @@ def sync_recent_from_intervals(
                 last_known_ftp = int(round(h_ftp))
             history_records.append({
                 "ts": hts,
+                "peak_1m_w": hrow.get("peak_1m_w"),
                 "peak_20m_w": hrow.get("peak_20m_w"),
                 "peak_5m_w": hrow.get("peak_5m_w"),
                 "Max Heart Rate": hrow.get("Max Heart Rate"),
@@ -1575,6 +1723,8 @@ def sync_recent_from_intervals(
         last_known_ftp = eff_ftp
         history_records.append({
             "ts": act_ts,
+            "mmp_curve": peaks.get("mmp_curve"),
+            "peak_1m_w": peaks.get("peak_1m_w"),
             "peak_20m_w": peaks.get("peak_20m_w"),
             "peak_5m_w": peaks.get("peak_5m_w"),
             "clean_max_hr": peaks.get("clean_max_hr"),

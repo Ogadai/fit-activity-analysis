@@ -10,9 +10,98 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src import config
+
+# Morton's 3-parameter Critical Power model (Morton, 1996) constants
+# (kept aligned with analyse-activities.py for consistent eFTP backfill & readiness)
+_MORTON_ALPHA_PRIOR: float = 68.0
+_MORTON_TAU_PRIOR: float = 68.0 / 3.0
+_MORTON_ALPHAS = np.linspace(35.0, 110.0, 76)
+_MORTON_TAUS = np.geomspace(6.0, 55.0, 30)
+_MORTON_ALPHA_GRID, _MORTON_TAU_GRID = np.meshgrid(
+    _MORTON_ALPHAS, _MORTON_TAUS, indexing="ij"
+)
+_MORTON_REG_GRID = (
+    0.0015 * ((_MORTON_ALPHA_GRID - _MORTON_ALPHA_PRIOR) / 20.0) ** 2
+    + 0.0008 * ((_MORTON_TAU_GRID - _MORTON_TAU_PRIOR) / 15.0) ** 2
+)
+
+
+def estimate_eftp_morton3p(
+    mmp_watts: dict[int, float],
+    min_duration_sec: int | None = None,
+) -> dict[str, Any] | None:
+    """
+    Estimate automated eFTP using Morton's 3-parameter Critical Power model:
+        P(t) = CP + W' / (t + tau),  tau = W' / (P_max - CP)
+    """
+    if not mmp_watts:
+        return None
+
+    pts = sorted(
+        (int(t), float(p))
+        for t, p in mmp_watts.items()
+        if t is not None and p is not None and int(t) > 0 and float(p) > 0
+    )
+    if not pts:
+        return None
+
+    ts = np.array([t for t, _ in pts], dtype=float)
+    ps = np.array([p for _, p in pts], dtype=float)
+    for i in range(len(ps) - 2, -1, -1):
+        if ps[i] < ps[i + 1]:
+            ps[i] = ps[i + 1]
+
+    min_dur = max(
+        60,
+        int(config.EFTP_MIN_DURATION_SEC if min_duration_sec is None else min_duration_sec),
+    )
+    aerobic_mask = ts >= min_dur
+    if not np.any(aerobic_mask):
+        return None
+
+    ts_a = ts[aerobic_mask]
+    ps_a = ps[aerobic_mask]
+
+    scale_a = 1.0 + _MORTON_ALPHA_GRID[:, :, None] / (
+        ts_a[None, None, :] + _MORTON_TAU_GRID[:, :, None]
+    )
+    cp_grid = np.max(ps_a[None, None, :] / scale_a, axis=2)
+
+    scale_all = 1.0 + _MORTON_ALPHA_GRID[:, :, None] / (
+        ts[None, None, :] + _MORTON_TAU_GRID[:, :, None]
+    )
+    pred_all = cp_grid[:, :, None] * scale_all
+    rel_err = (pred_all - ps[None, None, :]) / ps[None, None, :]
+
+    delta = 0.08
+    weights = np.where(aerobic_mask, 1.0, 0.35)[None, None, :]
+    err_sq = np.minimum(rel_err ** 2, delta ** 2)
+    loss_grid = np.sum(weights * err_sq, axis=2) + _MORTON_REG_GRID
+
+    best_flat = int(np.argmin(loss_grid))
+    ia, it = divmod(best_flat, _MORTON_TAUS.size)
+    cp = float(cp_grid[ia, it])
+    alpha = float(_MORTON_ALPHAS[ia])
+    tau = float(_MORTON_TAUS[it])
+    w_prime = cp * alpha
+    p_max = cp * (1.0 + alpha / tau)
+
+    implied_a = ps_a / (1.0 + alpha / (ts_a + tau))
+    best_a_idx = int(np.argmax(implied_a))
+
+    return {
+        "eftp": int(round(cp)),
+        "cp": round(cp, 1),
+        "w_prime": round(w_prime, 0),
+        "p_max": round(p_max, 0),
+        "tau": round(tau, 1),
+        "source_duration_sec": int(ts_a[best_a_idx]),
+        "source_watts": round(float(ps_a[best_a_idx]), 1),
+    }
 
 BASE_COLS: list[str] = [
     "Activity ID",
@@ -290,9 +379,9 @@ def insert_activities(rows: list[dict[str, Any]], db_path: Path | None = None) -
 
 def _backfill_dynamic_physiology(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Chronologically backfill missing effective_ftp and effective_max_hr from
-    peak_20m_w, peak_5m_w, and Max Heart Rate, and recalculate intensity_factor
-    and tss using effective_ftp.
+    Chronologically backfill missing effective_ftp and effective_max_hr using
+    Morton's 3-parameter eFTP model over peak_1m_w, peak_5m_w, peak_20m_w,
+    and 365-day Max Heart Rate, and recalculate intensity_factor and tss.
     """
     work = df.copy()
     if "Activity Date" in work.columns:
@@ -313,28 +402,29 @@ def _backfill_dynamic_physiology(df: pd.DataFrame) -> pd.DataFrame:
         existing_eff_ftp = _clean_value(row.get("effective_ftp"), "effective_ftp")
         existing_eff_hr = _clean_value(row.get("effective_max_hr"), "effective_max_hr")
 
-        p20_cur = _clean_value(row.get("peak_20m_w"), "peak_20m_w")
+        p1_cur = _clean_value(row.get("peak_1m_w"), "peak_1m_w")
         p5_cur = _clean_value(row.get("peak_5m_w"), "peak_5m_w")
+        p20_cur = _clean_value(row.get("peak_20m_w"), "peak_20m_w")
         hr_cur = _clean_value(row.get("Max Heart Rate"), "Max Heart Rate")
 
         if existing_eff_ftp is None:
-            ftp_candidates: list[float] = []
+            mmp_envelope: dict[int, float] = {}
             if has_ts:
-                ftp_cutoff = ts - timedelta(days=90)
+                ftp_cutoff = ts - timedelta(days=config.EFTP_WINDOW_DAYS)
                 for h in history:
                     hts = h["ts"]
                     if hts is not None and ftp_cutoff <= hts <= ts:
-                        if h["p20"] and h["p20"] > 0:
-                            ftp_candidates.append(0.95 * h["p20"])
-                        if h["p5"] and h["p5"] > 0:
-                            ftp_candidates.append(0.80 * h["p5"])
-            if p20_cur and p20_cur > 0:
-                ftp_candidates.append(0.95 * p20_cur)
-            if p5_cur and p5_cur > 0:
-                ftp_candidates.append(0.80 * p5_cur)
+                        for secs, key in ((60, "p1"), (300, "p5"), (1200, "p20")):
+                            val = h[key]
+                            if val and val > mmp_envelope.get(secs, 0.0):
+                                mmp_envelope[secs] = val
+            for secs, val in ((60, p1_cur), (300, p5_cur), (1200, p20_cur)):
+                if val and val > mmp_envelope.get(secs, 0.0):
+                    mmp_envelope[secs] = val
 
-            if ftp_candidates:
-                eff_ftp = int(round(max(ftp_candidates)))
+            eftp_res = estimate_eftp_morton3p(mmp_envelope)
+            if eftp_res is not None and eftp_res["eftp"] > 0:
+                eff_ftp = eftp_res["eftp"]
             elif last_known_ftp and last_known_ftp > 0:
                 eff_ftp = int(last_known_ftp)
             else:
@@ -369,6 +459,7 @@ def _backfill_dynamic_physiology(df: pd.DataFrame) -> pd.DataFrame:
         last_known_ftp = eff_ftp
         history.append({
             "ts": ts if has_ts else None,
+            "p1": p1_cur,
             "p20": p20_cur,
             "p5": p5_cur,
             "hr": hr_cur,
@@ -436,6 +527,7 @@ def compute_training_load(
                 "Activity Name",
                 activity_date_iso,
                 tss,
+                peak_1m_w,
                 peak_20m_w,
                 peak_5m_w,
                 "Max Heart Rate",
@@ -467,6 +559,7 @@ def compute_training_load(
     df = pd.DataFrame([dict(r) for r in rows])
     df["date"] = pd.to_datetime(df["activity_date_iso"]).dt.date
     df["tss"] = pd.to_numeric(df["tss"], errors="coerce").fillna(0.0)
+    df["peak_1m_w"] = pd.to_numeric(df["peak_1m_w"], errors="coerce")
     df["peak_20m_w"] = pd.to_numeric(df["peak_20m_w"], errors="coerce")
     df["peak_5m_w"] = pd.to_numeric(df["peak_5m_w"], errors="coerce")
     df["Max Heart Rate"] = pd.to_numeric(df["Max Heart Rate"], errors="coerce")
@@ -499,42 +592,38 @@ def compute_training_load(
         )
         current_dt += timedelta(days=1)
 
-    window_90_start = end_dt - timedelta(days=89)
+    window_90_start = end_dt - timedelta(days=max(1, config.EFTP_WINDOW_DAYS) - 1)
     recent_90_df = df[(df["date"] >= window_90_start) & (df["date"] <= end_dt)]
 
-    best_ftp_est: float | None = None
-    peak_power_source: dict[str, Any] | None = None
-
+    mmp_90d: dict[int, float] = {}
+    peak_source_by_sec: dict[int, dict[str, Any]] = {}
     for _, r in recent_90_df.iterrows():
-        p20 = r["peak_20m_w"]
-        p5 = r["peak_5m_w"]
-        if pd.notna(p20) and p20 > 0:
-            est = 0.95 * float(p20)
-            if best_ftp_est is None or est > best_ftp_est:
-                best_ftp_est = est
-                peak_power_source = {
+        for secs, col_name in ((60, "peak_1m_w"), (300, "peak_5m_w"), (1200, "peak_20m_w")):
+            val = r[col_name]
+            if pd.notna(val) and float(val) > mmp_90d.get(secs, 0.0):
+                w = float(val)
+                mmp_90d[secs] = w
+                peak_source_by_sec[secs] = {
                     "date": r["activity_date_iso"],
                     "activity_id": int(r["Activity ID"]),
                     "activity_name": r["Activity Name"],
-                    "metric": "peak_20m_w",
-                    "watts": round(float(p20), 1),
-                    "estimated_ftp": int(round(est)),
-                }
-        if pd.notna(p5) and p5 > 0:
-            est = 0.80 * float(p5)
-            if best_ftp_est is None or est > best_ftp_est:
-                best_ftp_est = est
-                peak_power_source = {
-                    "date": r["activity_date_iso"],
-                    "activity_id": int(r["Activity ID"]),
-                    "activity_name": r["Activity Name"],
-                    "metric": "peak_5m_w",
-                    "watts": round(float(p5), 1),
-                    "estimated_ftp": int(round(est)),
+                    "metric": col_name,
+                    "watts": round(w, 1),
                 }
 
-    if best_ftp_est is not None:
-        effective_ftp = int(round(best_ftp_est))
+    eftp_res = estimate_eftp_morton3p(mmp_90d)
+    peak_power_source: dict[str, Any] | None = None
+    if eftp_res is not None and eftp_res["eftp"] > 0:
+        effective_ftp = eftp_res["eftp"]
+        src_sec = eftp_res["source_duration_sec"]
+        if src_sec in peak_source_by_sec:
+            peak_power_source = {
+                **peak_source_by_sec[src_sec],
+                "estimated_ftp": effective_ftp,
+                "model": "morton_3p_eftp",
+                "w_prime_j": eftp_res["w_prime"],
+                "p_max_w": eftp_res["p_max"],
+            }
     else:
         prior_ftps = df[df["date"] <= end_dt]["effective_ftp"].dropna()
         effective_ftp = int(round(float(prior_ftps.iloc[-1]))) if not prior_ftps.empty else config.DEFAULT_FTP
