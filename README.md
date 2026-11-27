@@ -187,15 +187,18 @@ Available MCP tools and resources:
    - **Type:** `MCP (Streamable HTTP)`
    - **URL:** `http://cycling-mcp:8050/mcp`
    - **Auth:** `None`
-   Save and verify the connection discovers the tools (`get_training_playbook`, `get_current_readiness`, `get_recent_activities`, `sync_strava_now`, `query_training_database`).
+   Save and verify the connection discovers the tools (`get_training_playbook`, `get_current_readiness`, `get_recent_activities`, `get_activity_timeline`, `save_training_plan`, `get_training_plan`, `update_training_plan`, `save_athlete_note`, `get_athlete_notes`, `update_athlete_note`, `sync_activities_now`, `sync_intervals_now`, `sync_strava_now`, `query_training_database`).
+
+   > **Note on existing Open WebUI databases:** `docker-compose.yml` points Open WebUI's `OPENAI_API_BASE_URL` at `http://cycling-mcp:8050/gemini/v1`, a built-in compatibility proxy that fixes Gemini's missing SSE `tool_calls[].index`, preserves `thought_signature` across multi-turn tool calls, and flattens MCP `anyOf` parameter schemas so **Native** function calling works reliably. If you already initialized Open WebUI before this change, also update the OpenAI API URL under **Admin Panel → Settings → Connections** to `http://cycling-mcp:8050/gemini/v1` and save.
 
 4. **Create a "Cycling Coach" custom model preset:**
    Go to **Workspace → Models → Create a Model**:
    - **Name:** `Cycling Coach`
    - **Base Model:** `gemini-2.5-pro`
    - **Tools:** Enable the Strava Cycling Coach MCP server added in step 3
+   - **Advanced Params → Function Calling:** `Native` *(required for multi-step tool chains like reading readiness and then calling `save_training_plan()`)*
    - **System Prompt:**
      ```text
-     You are my personal AI cycling coach. Whenever I ask for cycling or Zwift training advice, session recommendations, or recovery guidance, ALWAYS call get_training_playbook(), get_current_readiness(), and get_recent_activities(days=10) first. Base all target wattages on my rolling effective_ftp and heart rate caps on effective_max_hr.
+     You are my personal AI cycling coach. Whenever I ask for cycling or Zwift training advice, session recommendations, training plans, or recovery guidance, ALWAYS call get_training_playbook(), get_current_readiness(), get_recent_activities(days=10), get_training_plan(), and get_athlete_notes() first. Base all target wattages on my rolling effective_ftp and heart rate caps on effective_max_hr. Whenever you create or revise a training plan, call save_training_plan() (or update_training_plan()) to store it in the database. Whenever I share schedule constraints, injuries, or preferences, save them with save_athlete_note().
      ```
    Save the model and select **Cycling Coach** for mobile and desktop coaching chats.

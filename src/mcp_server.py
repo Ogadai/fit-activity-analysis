@@ -13,8 +13,9 @@ from typing import Any
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.routing import Route
 
-from src import config, db, scheduler
+from src import config, db, gemini_proxy, scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -539,21 +540,27 @@ def update_athlete_note(
 
 @asynccontextmanager
 async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
-    """Manage the background Strava scheduler and FastMCP session manager."""
+    """Manage the background Strava scheduler, Gemini proxy client, and FastMCP session manager."""
     sched = scheduler.start_scheduler(run_on_startup=True)
     try:
         async with mcp.session_manager.run():
             yield
     finally:
+        await gemini_proxy.close_http_client()
         scheduler.stop_scheduler(sched)
 
 
 def create_app() -> Starlette:
-    """Build the combined ASGI app exposing Streamable HTTP (/mcp) and SSE (/sse)."""
+    """Build the combined ASGI app exposing Streamable HTTP (/mcp), SSE (/sse), and Gemini proxy (/gemini/v1)."""
     http_app = mcp.streamable_http_app()
     sse_app = mcp.sse_app()
+    proxy_route = Route(
+        "/gemini/v1/{path:path}",
+        gemini_proxy.gemini_proxy_endpoint,
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    )
     return Starlette(
-        routes=[*http_app.routes, *sse_app.routes],
+        routes=[proxy_route, *http_app.routes, *sse_app.routes],
         lifespan=_lifespan,
     )
 
@@ -565,7 +572,8 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger.info(
-        "Starting StravaCyclingCoach FastMCP server on %s:%s (Streamable HTTP /mcp & SSE /sse)...",
+        "Starting StravaCyclingCoach FastMCP server on %s:%s "
+        "(Streamable HTTP /mcp, SSE /sse, Gemini proxy /gemini/v1)...",
         config.MCP_HOST,
         config.MCP_PORT,
     )

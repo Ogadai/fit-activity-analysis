@@ -35,3 +35,10 @@ INTERVALS_ATHLETE_ID: str = os.getenv("INTERVALS_ATHLETE_ID", "0")
 STRAVA_CLIENT_ID: str = os.getenv("STRAVA_CLIENT_ID", "")
 STRAVA_CLIENT_SECRET: str = os.getenv("STRAVA_CLIENT_SECRET", "")
 STRAVA_REFRESH_TOKEN: str = os.getenv("STRAVA_REFRESH_TOKEN", "")
+
+# Gemini OpenAI-compatible proxy settings (used by Open WebUI at /gemini/v1)
+GEMINI_OPENAI_BASE_URL: str = os.getenv(
+    "GEMINI_OPENAI_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/openai",
+).rstrip("/")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")

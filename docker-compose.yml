@@ -19,6 +19,8 @@ services:
       - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID:-}
       - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET:-}
       - STRAVA_REFRESH_TOKEN=${STRAVA_REFRESH_TOKEN:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_OPENAI_BASE_URL=${GEMINI_OPENAI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
     networks:
       - coach_net
 
@@ -56,7 +58,7 @@ services:
       - WEBUI_NAME=Strava Cycling Coach
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-to-a-long-random-secret}
       - ENABLE_OPENAI_API=true
-      - OPENAI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      - OPENAI_API_BASE_URL=http://cycling-mcp:8050/gemini/v1
       - OPENAI_API_KEY=${GEMINI_API_KEY}
       - DEFAULT_MODELS=gemini-2.5-pro
       - ENABLE_OLLAMA_API=false

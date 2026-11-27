@@ -2,6 +2,7 @@ fitdecode
 numpy
 pandas
 requests
+httpx
 mcp[cli]>=1.8.0,<2
 apscheduler
 uvicorn
